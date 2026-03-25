@@ -1,0 +1,56 @@
+// Auto-generated UVM test for: {{ module }}
+// Alternates between random and BMC-directed phases.
+`ifndef {{ module | upper }}_TEST_SV
+`define {{ module | upper }}_TEST_SV
+
+`include "uvm_macros.svh"
+import uvm_pkg::*;
+
+`include "{{ module }}_seq_item.sv"
+`include "{{ module }}_driver.sv"
+`include "{{ module }}_monitor.sv"
+`include "{{ module }}_agent.sv"
+`include "{{ module }}_env.sv"
+`include "{{ module }}_rand_seq.sv"
+`include "{{ module }}_bmc_seq.sv"
+
+class {{ module }}_covfuzz_test extends uvm_test;
+    `uvm_component_utils({{ module }}_covfuzz_test)
+
+    {{ module }}_env env;
+
+    // Configuration
+    int unsigned rand_phase_transactions = 500;
+    int unsigned num_bmc_phases          = 10;
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+        env = {{ module }}_env::type_id::create("env", this);
+        uvm_config_db #(virtual {{ module }}_if)::set(this, "env.agent.*", "vif", vif);
+    endfunction
+
+    virtual {{ module }}_if vif;
+
+    task run_phase(uvm_phase phase);
+        {{ module }}_rand_seq rand_seq;
+        phase.raise_objection(this);
+
+        // Phase 1: initial random exploration
+        `uvm_info("TEST", "Starting random phase", UVM_LOW)
+        rand_seq = {{ module }}_rand_seq::type_id::create("rand_seq");
+        rand_seq.num_transactions = rand_phase_transactions;
+        rand_seq.start(env.agent.sequencer);
+
+        // Note: BMC-directed phases are orchestrated externally by covfuzz.
+        // This test runs the initial random phase only.
+        // See covfuzz/orchestrator.py for the full coverage-directed loop.
+
+        phase.drop_objection(this);
+    endtask
+endclass
+
+`endif

@@ -1,0 +1,35 @@
+// Auto-generated BMC-directed UVM sequence for: {{ module }}
+// Replays a pre-computed input sequence produced by the SymbFuzz BMC engine.
+`ifndef {{ module | upper }}_BMC_SEQ_SV
+`define {{ module | upper }}_BMC_SEQ_SV
+
+typedef struct packed {
+{% for inp in data_inputs %}
+    logic {% if inp.width > 1 %}[{{ inp.width - 1 }}:0] {% endif %}{{ inp.name }};
+{% endfor %}
+} {{ module }}_cycle_inputs_t;
+
+class {{ module }}_bmc_seq extends uvm_sequence #({{ module }}_seq_item);
+    `uvm_object_utils({{ module }}_bmc_seq)
+
+    // Populated by the orchestrator before start() is called
+    {{ module }}_cycle_inputs_t bmc_steps[];
+
+    function new(string name = "{{ module }}_bmc_seq");
+        super.new(name);
+    endfunction
+
+    task body();
+        {{ module }}_seq_item item;
+        foreach (bmc_steps[i]) begin
+            item = {{ module }}_seq_item::type_id::create("item");
+            start_item(item);
+{% for inp in data_inputs %}
+            item.{{ inp.name }} = bmc_steps[i].{{ inp.name }};
+{% endfor %}
+            finish_item(item);
+        end
+    endtask
+endclass
+
+`endif

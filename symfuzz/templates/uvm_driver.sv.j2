@@ -1,0 +1,39 @@
+// Auto-generated UVM driver for: {{ module }}
+`ifndef {{ module | upper }}_DRIVER_SV
+`define {{ module | upper }}_DRIVER_SV
+
+class {{ module }}_driver extends uvm_driver #({{ module }}_seq_item);
+    `uvm_component_utils({{ module }}_driver)
+
+    virtual {{ module }}_if vif;
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+        if (!uvm_config_db #(virtual {{ module }}_if)::get(this, "", "vif", vif))
+            `uvm_fatal("NO_VIF", "No virtual interface found")
+    endfunction
+
+    task run_phase(uvm_phase phase);
+        {{ module }}_seq_item req;
+{% if reset_port %}
+        // Assert reset for a few cycles at start
+        vif.{{ reset_port }} = 1'b{{ "0" if reset_active_low else "1" }};
+        repeat (5) @(vif.cb);
+        vif.{{ reset_port }} = 1'b{{ "1" if reset_active_low else "0" }};
+{% endif %}
+        forever begin
+            seq_item_port.get_next_item(req);
+            @(vif.cb);
+{% for inp in data_inputs %}
+            vif.cb.{{ inp.name }} <= req.{{ inp.name }};
+{% endfor %}
+            seq_item_port.item_done();
+        end
+    endtask
+endclass
+
+`endif

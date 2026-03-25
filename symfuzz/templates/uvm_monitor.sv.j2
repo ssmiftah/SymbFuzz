@@ -1,0 +1,43 @@
+// Auto-generated UVM monitor + coverage for: {{ module }}
+`ifndef {{ module | upper }}_MONITOR_SV
+`define {{ module | upper }}_MONITOR_SV
+
+class {{ module }}_monitor extends uvm_monitor;
+    `uvm_component_utils({{ module }}_monitor)
+
+    virtual {{ module }}_if vif;
+    uvm_analysis_port #({{ module }}_seq_item) ap;
+
+    // FSM state coverage group
+    covergroup {{ module }}_state_cg @(posedge vif.{{ clock_port }});
+{% for out in outputs %}
+        {{ out.name }}_cp: coverpoint vif.{{ out.name }};
+{% endfor %}
+    endgroup
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+        {{ module }}_state_cg = new();
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+        ap = new("ap", this);
+        if (!uvm_config_db #(virtual {{ module }}_if)::get(this, "", "vif", vif))
+            `uvm_fatal("NO_VIF", "No virtual interface found")
+    endfunction
+
+    task run_phase(uvm_phase phase);
+        {{ module }}_seq_item trans;
+        forever begin
+            @(vif.cb);
+            trans = {{ module }}_seq_item::type_id::create("trans");
+{% for inp in data_inputs %}
+            trans.{{ inp.name }} = vif.cb.{{ inp.name }};
+{% endfor %}
+            ap.write(trans);
+        end
+    endtask
+endclass
+
+`endif

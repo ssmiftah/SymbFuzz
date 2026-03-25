@@ -1,0 +1,141 @@
+# Auto-generated Vivado xsim TCL simulation bridge for module: {{ module }}
+# Protocol: line-delimited JSON over stdin/stdout
+#   in:  {"cmd":"step","inputs":{name:val,...}}
+#   in:  {"cmd":"reset","cycles":N}
+#   in:  {"cmd":"read_state"}
+#   in:  {"cmd":"force","state":{arch_name:val,...}}
+#   in:  {"cmd":"quit"}
+#   out: {"state":{arch_name:val,...}}  or  {"ok":true}  or  {"error":"msg"}
+
+# ---- JSON helpers ---------------------------------------------------- #
+# Note: hex escapes (\x7b = open-brace, \x7d = close-brace) are used in
+# regex patterns to keep TCL brace counting balanced inside proc bodies.
+
+# Extract an integer value for "key" from a JSON line (-1 if not found)
+proc json_get_int {json key} {
+    if {[regexp "\"${key}\"\\s*:\\s*(-?\\d+)" $json -> val]} {
+        return $val
+    }
+    return -1
+}
+
+# Extract the sub-object string for "key":OBJECT — returns the object or ""
+proc json_get_object {json key} {
+    # Pattern: "key" : open-brace  (using \x7b to avoid brace imbalance)
+    set pattern "\"${key}\"\\s*:\\s*\\x7b"
+    if {![regexp -indices $pattern $json range]} { return "" }
+    # range end is the index of the open brace character
+    set start [lindex $range 1]
+    set depth 1
+    set i [expr {$start + 1}]
+    set len [string length $json]
+    while {$i < $len && $depth > 0} {
+        set ch [string index $json $i]
+        if {$ch eq "\{"} { incr depth }
+        if {$ch eq "\}"} { incr depth -1 }
+        incr i
+    }
+    return [string range $json $start [expr {$i - 1}]]
+}
+
+# Parse all "key":integer pairs from a simple JSON object string
+proc json_parse_kv {obj} {
+    set result {}
+    foreach {_ k v} [regexp -all -inline {"(\w+)"\s*:\s*(\d+)} $obj] {
+        lappend result $k $v
+    }
+    return $result
+}
+
+# ---- Signal accessors ------------------------------------------------ #
+
+proc emit_state {} {
+    set parts {}
+{% for reg in registers %}
+    lappend parts "\"{{ reg.arch_name }}\":[get_value -radix unsigned /{{ module }}/{{ reg.xsim_path }}]"
+{% endfor %}
+    puts "\{\"state\":\{[join $parts ,]\}\}"
+    flush stdout
+}
+
+proc set_input {name val} {
+{% for inp in data_inputs %}
+    if {$name eq "{{ inp.name }}"} {
+        set_value -radix unsigned /{{ module }}/{{ inp.name }} $val
+        return
+    }
+{% endfor %}
+}
+
+proc force_reg {name val} {
+{% for reg in registers %}
+    if {$name eq "{{ reg.arch_name }}"} {
+        set_value -radix unsigned /{{ module }}/{{ reg.xsim_path }} $val
+        return
+    }
+{% endfor %}
+}
+
+proc clk_posedge {} {
+    set_value -radix unsigned /{{ module }}/{{ clock_port }} 0
+    run 5 ns
+    set_value -radix unsigned /{{ module }}/{{ clock_port }} 1
+    run 5 ns
+}
+
+# ---- Initialise simulation ------------------------------------------- #
+set_value -radix unsigned /{{ module }}/{{ clock_port }} 0
+{% if reset_port %}
+set_value -radix unsigned /{{ module }}/{{ reset_port }} {{ "0" if reset_active_low else "1" }}
+{% endif %}
+
+# ---- Main command loop ----------------------------------------------- #
+while {[gets stdin line] >= 0} {
+    set line [string trim $line]
+    if {$line eq ""} { continue }
+
+    if {[string match *"step"* $line]} {
+        set inputs_obj [json_get_object $line "inputs"]
+        if {$inputs_obj ne ""} {
+            foreach {k v} [json_parse_kv $inputs_obj] {
+                set_input $k $v
+            }
+        }
+        clk_posedge
+        emit_state
+
+    } elseif {[string match *"reset"* $line]} {
+        set cycles [json_get_int $line "cycles"]
+        if {$cycles < 0} { set cycles 5 }
+{% if reset_port %}
+        set_value -radix unsigned /{{ module }}/{{ reset_port }} {{ "0" if reset_active_low else "1" }}
+{% endif %}
+        for {set i 0} {$i < $cycles} {incr i} { clk_posedge }
+{% if reset_port %}
+        set_value -radix unsigned /{{ module }}/{{ reset_port }} {{ "1" if reset_active_low else "0" }}
+{% endif %}
+        clk_posedge
+        puts "\{\"ok\":true\}"
+        flush stdout
+
+    } elseif {[string match *"read_state"* $line]} {
+        emit_state
+
+    } elseif {[string match *"force"* $line]} {
+        set state_obj [json_get_object $line "state"]
+        if {$state_obj ne ""} {
+            foreach {k v} [json_parse_kv $state_obj] {
+                force_reg $k $v
+            }
+        }
+        puts "\{\"ok\":true\}"
+        flush stdout
+
+    } elseif {[string match *"quit"* $line]} {
+        break
+
+    } else {
+        puts "\{\"error\":\"unknown command\"\}"
+        flush stdout
+    }
+}

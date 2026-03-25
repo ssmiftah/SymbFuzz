@@ -1,0 +1,45 @@
+// Auto-generated UVM testbench top for: {{ module }}
+`timescale 1ns/1ps
+
+`include "uvm_macros.svh"
+import uvm_pkg::*;
+
+`include "{{ module }}_test.sv"
+
+module tb_{{ module }}_uvm;
+    // Clock generation
+    logic {{ clock_port }} = 0;
+    always #5 {{ clock_port }} = ~{{ clock_port }};
+
+    // DUT interface
+    {{ module }}_if dut_if(.{{ clock_port }}({{ clock_port }}));
+
+    // DUT instantiation
+    {{ module }} dut (
+        .{{ clock_port }}(dut_if.{{ clock_port }}){% if all_ports %},{% endif %}
+
+{% for inp in data_inputs %}
+        .{{ inp.name }}(dut_if.{{ inp.name }}){% if not loop.last or outputs or reset_port %},{% endif %}
+
+{% endfor %}
+{% if reset_port %}
+        .{{ reset_port }}(dut_if.{{ reset_port }}){% if outputs %},{% endif %}
+
+{% endif %}
+{% for out in outputs %}
+        .{{ out.name }}(dut_if.{{ out.name }}){% if not loop.last %},{% endif %}
+
+{% endfor %}
+    );
+
+    initial begin
+        uvm_config_db #(virtual {{ module }}_if)::set(null, "uvm_test_top.*", "vif", dut_if);
+        run_test("{{ module }}_covfuzz_test");
+    end
+
+    // Timeout watchdog
+    initial begin
+        #1_000_000;
+        `uvm_fatal("TIMEOUT", "Simulation timeout")
+    end
+endmodule

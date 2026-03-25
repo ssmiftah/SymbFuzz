@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Auto-generated Vivado xsim compile script for: {{ module }}
+# Usage: bash compile_{{ module }}.sh
+
+set -e
+TOP="{{ module }}"
+SNAPSHOT="${TOP}_sim"
+
+echo "[symfuzz] Compiling ${TOP} with Vivado xsim ..."
+
+# Step 1: Analyse all Verilog/SystemVerilog sources (dependencies first)
+{% for f in verilog_files %}
+xvlog -sv "{{ f }}"
+{% endfor %}
+
+# Step 2: Elaborate — enable full debug access for get_value / set_value
+xelab -debug all -top "$TOP" -snapshot "$SNAPSHOT"
+
+echo "[symfuzz] Snapshot ready: ${SNAPSHOT}"

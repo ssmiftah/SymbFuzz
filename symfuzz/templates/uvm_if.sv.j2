@@ -1,0 +1,29 @@
+// Auto-generated UVM interface for: {{ module }}
+interface {{ module }}_if (input logic {{ clock_port }});
+{% for inp in data_inputs %}
+    logic {% if inp.width > 1 %}[{{ inp.width - 1 }}:0] {% endif %}{{ inp.name }};
+{% endfor %}
+{% if reset_port %}
+    logic {{ reset_port }};
+{% endif %}
+{% for out in outputs %}
+    logic {% if out.width > 1 %}[{{ out.width - 1 }}:0] {% endif %}{{ out.name }};
+{% endfor %}
+
+    // Clocking block for synchronous driver/monitor
+    clocking cb @(posedge {{ clock_port }});
+        default input #1 output #1;
+{% for inp in data_inputs %}
+        output {{ inp.name }};
+{% endfor %}
+{% if reset_port %}
+        output {{ reset_port }};
+{% endif %}
+{% for out in outputs %}
+        input  {{ out.name }};
+{% endfor %}
+    endclocking
+
+    modport driver_mp  (clocking cb{% if reset_port %}, output {{ reset_port }}{% endif %});
+    modport monitor_mp (clocking cb);
+endinterface

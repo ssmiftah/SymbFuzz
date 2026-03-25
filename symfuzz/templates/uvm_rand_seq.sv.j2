@@ -1,0 +1,27 @@
+// Auto-generated random UVM sequence for: {{ module }}
+`ifndef {{ module | upper }}_RAND_SEQ_SV
+`define {{ module | upper }}_RAND_SEQ_SV
+
+// Drives N fully-random input transactions.
+class {{ module }}_rand_seq extends uvm_sequence #({{ module }}_seq_item);
+    `uvm_object_utils({{ module }}_rand_seq)
+
+    int unsigned num_transactions = 500;
+
+    function new(string name = "{{ module }}_rand_seq");
+        super.new(name);
+    endfunction
+
+    task body();
+        {{ module }}_seq_item item;
+        repeat (num_transactions) begin
+            item = {{ module }}_seq_item::type_id::create("item");
+            start_item(item);
+            if (!item.randomize())
+                `uvm_fatal("RAND_FAIL", "Randomization failed")
+            finish_item(item);
+        end
+    endtask
+endclass
+
+`endif

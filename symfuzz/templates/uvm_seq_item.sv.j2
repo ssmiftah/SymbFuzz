@@ -1,0 +1,29 @@
+// Auto-generated UVM sequence item for: {{ module }}
+`ifndef {{ module | upper }}_SEQ_ITEM_SV
+`define {{ module | upper }}_SEQ_ITEM_SV
+
+class {{ module }}_seq_item extends uvm_sequence_item;
+    `uvm_object_utils({{ module }}_seq_item)
+
+    // One transaction = one clock cycle's worth of data inputs
+{% for inp in data_inputs %}
+    rand logic {% if inp.width > 1 %}[{{ inp.width - 1 }}:0] {% endif %}{{ inp.name }};
+{% endfor %}
+{% if reset_port %}
+    logic {{ reset_port }} = 1'b0;  // not randomized; set explicitly
+{% endif %}
+
+    function new(string name = "{{ module }}_seq_item");
+        super.new(name);
+    endfunction
+
+    function string convert2string();
+        string s = "";
+{% for inp in data_inputs %}
+        s = {s, $sformatf(" {{ inp.name }}=%0h", {{ inp.name }})};
+{% endfor %}
+        return s;
+    endfunction
+endclass
+
+`endif
