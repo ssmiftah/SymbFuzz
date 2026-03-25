@@ -31,23 +31,23 @@ The campaign runs until every architectural register combination has been visite
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                       symfuzz campaign loop                          │
+│                       symfuzz campaign loop                         │
 │                                                                     │
-│  ┌──────────────┐   random inputs   ┌──────────────────────────┐   │
-│  │  Orchestrator│ ────────────────► │  Vivado xsim (SimDriver) │   │
-│  │              │ ◄──────────────── │  TCL bridge over JSON    │   │
-│  │  (coverage   │   {state dict}    └──────────────────────────┘   │
-│  │   stall?)    │                                                    │
-│  │              │   target dict     ┌──────────────────────────┐   │
-│  │              │ ────────────────► │  symbfuzz BMC binary     │   │
-│  │              │ ◄──────────────── │  Yosys → SMT2 → Z3       │   │
-│  │              │   input sequence  └──────────────────────────┘   │
-│  │              │                                                    │
-│  │              │   replay seq.     ┌──────────────────────────┐   │
-│  │              │ ────────────────► │  StateForcer (xsim replay│   │
-│  └──────┬───────┘                   └──────────────────────────┘   │
-│         │                                                            │
-│         ▼                                                            │
+│  ┌──────────────┐   random inputs   ┌──────────────────────────┐    │
+│  │  Orchestrator│ ────────────────► │  Vivado xsim (SimDriver) │    │
+│  │              │ ◄──────────────── │  TCL bridge over JSON    │    │
+│  │  (coverage   │   {state dict}    └──────────────────────────┘    │
+│  │   stall?)    │                                                   │
+│  │              │   target dict     ┌──────────────────────────┐    │
+│  │              │ ────────────────► │  symbfuzz BMC binary     │    │
+│  │              │ ◄──────────────── │  Yosys → SMT2 → Z3       │    │
+│  │              │   input sequence  └──────────────────────────┘    │
+│  │              │                                                   │
+│  │              │   replay seq.     ┌──────────────────────────┐    │
+│  │              │ ────────────────► │  StateForcer (xsim replay│    │
+│  └──────┬───────┘                   └──────────────────────────┘    │
+│         │                                                           │
+│         ▼                                                           │
 │  ┌──────────────┐                                                   │
 │  │  CoverageDB  │  SQLite — visited states, coverage log            │
 │  └──────────────┘                                                   │
@@ -283,14 +283,36 @@ symfuzz \
 
 Pass **sub-module files before the top-level file**. All files are compiled with xvlog in order.
 
+### SystemVerilog design (with sv2v)
+
+Designs using SystemVerilog constructs Yosys cannot parse (`parameter type`, struct casts, complex package functions) must be preprocessed with [`sv2v`](https://github.com/zachjs/sv2v) first. Pass `--sv2v` and list package files before the top-level module:
+
+```bash
+symfuzz \
+    RTL_Tst_Cases/cva6-5.3.0/core/include/config_pkg.sv \
+    RTL_Tst_Cases/cva6-5.3.0/core/include/riscv_pkg.sv \
+    RTL_Tst_Cases/cva6-5.3.0/core/include/cv64a6_imafdc_sv39_config_pkg.sv \
+    RTL_Tst_Cases/cva6-5.3.0/core/include/ariane_pkg.sv \
+    RTL_Tst_Cases/cva6-5.3.0/vendor/pulp-platform/common_cells/src/cf_math_pkg.sv \
+    RTL_Tst_Cases/cva6-5.3.0/vendor/pulp-platform/common_cells/src/lzc.sv \
+    RTL_Tst_Cases/cva6-5.3.0/core/serdiv.sv \
+    --top serdiv --sv2v --timeout 300
+```
+
+sv2v is installed automatically when the Python venv is active:
+
+```bash
+pip install sv2v-python   # or: apt install sv2v / download binary from GitHub
+```
+
+The converted Verilog is cached to `sv2v_cache/<top>__sv2v.v` so subsequent runs skip reconversion.
+
 ---
 
 ## 5. CLI Reference
 
 ```
 symfuzz [OPTIONS] <file1.v> [<file2.v> ...]
-# or equivalently:
-python symfuzz_run.py [OPTIONS] <file1.v> [<file2.v> ...]
 ```
 
 ### Positional arguments
@@ -317,6 +339,7 @@ python symfuzz_run.py [OPTIONS] <file1.v> [<file2.v> ...]
 | `--no-compile` | off | Skip xvlog/xelab compilation (reuse existing snapshot) |
 | `--no-uvm` | off | Skip UVM testbench generation |
 | `--gen-only` | off | Generate TB artifacts and exit without running simulation |
+| `--sv2v` | off | Preprocess sources with `sv2v` before Yosys. Required for SystemVerilog constructs Yosys cannot parse (`parameter type`, struct casts, complex package functions). `sv2v` must be on PATH. |
 | `--verbose`, `-v` | off | Print per-cycle coverage events and BMC invocations |
 
 ### Examples
@@ -334,6 +357,9 @@ symfuzz examples/lock_fsm.v --top lock_fsm \
 
 # Custom output directory
 symfuzz src/cpu.v pkg/types.sv --top cpu --output-dir /tmp/cpu_fuzz
+
+# SystemVerilog design requiring sv2v preprocessing
+symfuzz pkg/config_pkg.sv rtl/my_module.sv --top my_module --sv2v
 ```
 
 ---
@@ -495,6 +521,7 @@ design = parse_design(
     verilog_files,      # str | Path | list[str | Path]
     top_module=None,    # str — top module name (auto-detect if omitted)
     flatten=True,       # bool — flatten hierarchy before SMT2 export
+    use_sv2v=False,     # bool — preprocess with sv2v before Yosys
 )
 ```
 
@@ -777,7 +804,7 @@ Each entry in `steps` is one SMT2 transition. Because `clk2fflogic` produces two
 | File | Role |
 |------|------|
 | `cli.py` | Entry point. Parses arguments, orchestrates the full pipeline. |
-| `design_parser.py` | Runs Yosys, parses SMT2 annotations, produces `DesignInfo`. |
+| `design_parser.py` | Runs Yosys (optionally via sv2v preprocessing), parses SMT2 annotations, produces `DesignInfo`. |
 | `testbench_gen.py` | Renders Jinja2 templates to produce xsim and UVM artifacts. |
 | `sim_driver.py` | Spawns and drives the Vivado xsim subprocess via JSON protocol. |
 | `bmc_interface.py` | Calls the `symbfuzz` binary, filters posedge steps from JSON output. |
@@ -913,6 +940,18 @@ Designs using non-standard names must rename their ports or patch `design_parser
 ### Single-clock designs only
 
 SymbFuzz assumes one clock domain. Multi-clock designs are not supported.
+
+### SystemVerilog support requires sv2v
+
+Yosys (up to 0.63) cannot parse several SystemVerilog constructs commonly found in industrial designs:
+
+- `parameter type T = logic` — parametric types
+- Struct cast literals: `struct_t'(0)`
+- `assert ... else $fatal(...)` — elaboration-time fatal assertions
+
+Pass `--sv2v` to convert sources to plain Verilog-2005 before Yosys. The converted file is written to `sv2v_cache/<top>__sv2v.v` and reused for both Yosys analysis and xsim compilation. Install sv2v from [github.com/zachjs/sv2v](https://github.com/zachjs/sv2v).
+
+After sv2v conversion, Yosys's `opt` pass may create internal flip-flops named after source line numbers (e.g., `sv2v_out.v:190$23_Y`). These are automatically filtered from the register list by `design_parser.py` — they never appear in coverage tracking.
 
 ### xsim only
 
