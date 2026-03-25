@@ -61,7 +61,7 @@ proc emit_state {} {
 proc set_input {name val} {
 {% for inp in data_inputs %}
     if {$name eq "{{ inp.name }}"} {
-        set_value -radix unsigned /{{ module }}/{{ inp.name }} $val
+        set_value -radix hex /{{ module }}/{{ inp.name }} [format %llx $val]
         return
     }
 {% endfor %}
@@ -70,7 +70,7 @@ proc set_input {name val} {
 proc force_reg {name val} {
 {% for reg in registers %}
     if {$name eq "{{ reg.arch_name }}"} {
-        set_value -radix unsigned /{{ module }}/{{ reg.xsim_path }} $val
+        set_value -radix hex /{{ module }}/{{ reg.xsim_path }} [format %llx $val]
         return
     }
 {% endfor %}

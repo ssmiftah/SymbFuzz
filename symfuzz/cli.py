@@ -46,6 +46,11 @@ def main(argv=None):
                     help="Enable verbose output")
     ap.add_argument("--gen-only", action="store_true",
                     help="Only generate TB artifacts, do not run simulation")
+    ap.add_argument("--sv2v", action="store_true",
+                    help="Preprocess sources with sv2v before Yosys. Required for "
+                         "designs that use SV constructs Yosys cannot parse "
+                         "(parameter type, struct casts, complex package functions). "
+                         "sv2v must be installed: https://github.com/zachjs/sv2v")
 
     args = ap.parse_args(argv)
 
@@ -65,9 +70,11 @@ def main(argv=None):
 
     output_dir = Path(args.output_dir or f"{module_name}_symfuzz").resolve()
 
+    if args.sv2v:
+        print("[symfuzz] sv2v preprocessing enabled")
     print(f"[symfuzz] Parsing design: {verilog_files} (top: {module_name})")
     try:
-        design = parse_design(verilog_files, top_module=module_name)
+        design = parse_design(verilog_files, top_module=module_name, use_sv2v=args.sv2v)
     except RuntimeError as e:
         print(f"[symfuzz] ERROR: {e}", file=sys.stderr)
         sys.exit(1)
