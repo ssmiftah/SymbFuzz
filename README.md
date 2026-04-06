@@ -958,6 +958,8 @@ After sv2v conversion, Yosys's `opt` pass may create internal flip-flops named a
 
 The simulation backend is Vivado xsim. Verilator and other simulators would require a new `SimDriver` implementation.
 
+---
+
 ## 14. Bibtex for the Paper
 
 ```bibtex
