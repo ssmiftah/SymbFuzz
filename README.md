@@ -65,6 +65,20 @@ Exact versions, install pointers, and known-good toolchain combinations live in 
 
 See [docs/USER_MANUAL.md](docs/USER_MANUAL.md) §"Known limitations" for workarounds.
 
-## License
+## Paper Bibtex
 
-See [LICENSE](LICENSE) if present; otherwise all rights reserved by the repository owner.
+```
+@inbook{10.1145/3725843.3756131,
+author = {Miftah, Samit Shahnawaz and Srivastava, Amisha and Kim, Hyunmin and Wei, Shiyi and Basu, Kanad},
+title = {SymbFuzz: Symbolic Execution Guided Hardware Fuzzing},
+year = {2025},
+isbn = {9798400715730},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+url = {https://doi.org/10.1145/3725843.3756131},
+abstract = {Modern hardware incorporates reusable designs to reduce cost and time to market, inadvertently increasing exposure to security vulnerabilities. While formal verification and simulation-based approaches have been traditionally utilized to mitigate these vulnerabilities, formal techniques are hindered by scalability issues, while conventional simulation methods frequently overlook critical edge cases. Fuzzing, as a simulation-based strategy, has demonstrated considerable promise in enhancing the security of both software and hardware; however, it is impeded by challenges such as limited input coverage, difficulties in traversing branching paths, and the complexity of managing circuit parameters, in addition to the limited adaptability of existing hardware fuzzing techniques within industrial workflows. To address these limitations, we propose SymbFuzz, an innovative hybrid hardware fuzzing methodology that leverages symbolic execution to achieve superior coverage. SymbFuzz is the first hardware fuzzing technique to be implemented on the industry-standard Universal Verification Methodology (UVM), facilitating seamless integration into commercial hardware verification flows. SymbFuzz was evaluated on a diverse set of processor RTLs, including OpenTitan (Ibex), CVA6, Rocket-Core, and Mor1kx. These designs span a range of processor architectures and complexities. SymbFuzz detected all bugs previously found by existing fuzzers and additionally uncovered 14 new bugs, including a vulnerability in OpenTitan, reported in the CWE 2025 database. It also achieved up to 6.8 \texttimes{} faster convergence compared to traditional UVM random testing and over 2 \texttimes{} 104 additional functional coverage points compared to state-of-the-art fuzzers, demonstrating its effectiveness in improving RTL validation across varied processor architectures.},
+booktitle = {Proceedings of the 58th IEEE/ACM International Symposium on Microarchitecture},
+pages = {1477–1490},
+numpages = {14}
+}
+```
