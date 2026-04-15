@@ -48,19 +48,19 @@ class StateForcer:
         if reset_first:
             self.driver.reset(cycles=5)
 
-        states: list[dict[str, int]] = []
+        filtered_list: list[dict[str, int]] = []
         for step_inputs in bmc_result.steps:
-            # Map BMC step inputs (may include "clk") to data-port dict
             filtered = {
                 k: v for k, v in step_inputs.items()
                 if k != self.design.clock_port
             }
-            # Fill in any missing ports with 0
             for p in self.design.data_inputs:
                 filtered.setdefault(p.name, 0)
+            filtered_list.append(filtered)
 
-            states.append(self.driver.step(filtered))
-
+        states, err = self.driver.step_trace(filtered_list)
+        if err is not None:
+            raise RuntimeError(f"replay_sequence: {err}")
         return states
 
     # ------------------------------------------------------------------ #

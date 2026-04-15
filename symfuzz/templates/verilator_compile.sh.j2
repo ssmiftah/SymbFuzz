@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Auto-generated Verilator build script for module: {{ module }}
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+# Verilator flags:
+#   --cc --exe --build  : generate C++, link with our harness, build via make
+#   --public-flat-rw    : expose every signal for read/write (needed for
+#                         set_value/get_value style access from the harness)
+#   -Wno-fatal          : downgrade lint warnings to non-fatal
+#   -Wno-UNOPTFLAT      : allow combinational loops Yosys/xsim already accept
+#   -O3                 : optimize the generated C++ model
+verilator --cc --exe --build \
+    --top-module {{ module }} \
+    --public-flat-rw \
+    -Wno-fatal -Wno-UNOPTFLAT \
+    -O3 \
+{% if verilator_threads and verilator_threads > 1 %}    --threads {{ verilator_threads }} \
+{% endif %}{% if native_coverage %}    --coverage-line --coverage-toggle \
+{% endif %}    -o {{ module }}_sim \
+{% for v in verilog_files %}    "{{ v }}" \
+{% endfor %}    harness.cpp
+
+echo "[verilator] snapshot ready: obj_dir/{{ module }}_sim"

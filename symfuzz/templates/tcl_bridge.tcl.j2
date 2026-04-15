@@ -1,11 +1,16 @@
 # Auto-generated Vivado xsim TCL simulation bridge for module: {{ module }}
 # Protocol: line-delimited JSON over stdin/stdout
 #   in:  {"cmd":"step","inputs":{name:val,...}}
+#   in:  {"cmd":"step_trace","inputs":[{...},{...},...]}
 #   in:  {"cmd":"reset","cycles":N}
 #   in:  {"cmd":"read_state"}
 #   in:  {"cmd":"force","state":{arch_name:val,...}}
+#   in:  {"cmd":"checkpoint","path":"<abs-path>"}   (unsupported on xsim 2025.2)
+#   in:  {"cmd":"restore","path":"<abs-path>"}      (unsupported on xsim 2025.2)
 #   in:  {"cmd":"quit"}
-#   out: {"state":{arch_name:val,...}}  or  {"ok":true}  or  {"error":"msg"}
+#   out: {"state":{arch_name:val,...}}  or  {"states":[{...},...]}
+#   out: {"states":[...],"error":"<msg>"}  (partial batch on step_trace failure)
+#   out: {"ok":true}  or  {"error":"msg"}
 
 # ---- JSON helpers ---------------------------------------------------- #
 # Note: hex escapes (\x7b = open-brace, \x7d = close-brace) are used in
@@ -17,6 +22,14 @@ proc json_get_int {json key} {
         return $val
     }
     return -1
+}
+
+# Extract a double-quoted string value for "key" from a JSON line ("" if absent)
+proc json_get_string {json key} {
+    if {[regexp "\"${key}\"\\s*:\\s*\"(\[^\"\]*)\"" $json -> val]} {
+        return $val
+    }
+    return ""
 }
 
 # Extract the sub-object string for "key":OBJECT — returns the object or ""
@@ -77,10 +90,63 @@ proc force_reg {name val} {
 }
 
 proc clk_posedge {} {
+    # Single-run rising-edge clock. Synchronous-only designs don't need a
+    # separate negedge half-cycle; this halves the scheduler work per step.
     set_value -radix unsigned /{{ module }}/{{ clock_port }} 0
-    run 5 ns
     set_value -radix unsigned /{{ module }}/{{ clock_port }} 1
-    run 5 ns
+    run {{ clock_period }}
+}
+
+proc emit_state_str {} {
+    set parts {}
+{% for reg in registers %}
+    lappend parts "\"{{ reg.arch_name }}\":[get_value -radix unsigned /{{ module }}/{{ reg.xsim_path }}]"
+{% endfor %}
+    return "\{[join $parts ,]\}"
+}
+
+# Split the body of a JSON array (without the surrounding brackets) into a
+# list of top-level {...} object substrings. Handles nested braces safely.
+proc json_split_objs {body} {
+    set result {}
+    set len [string length $body]
+    set i 0
+    while {$i < $len} {
+        set ch [string index $body $i]
+        if {$ch eq "\{"} {
+            set depth 1
+            set start $i
+            incr i
+            while {$i < $len && $depth > 0} {
+                set c2 [string index $body $i]
+                if {$c2 eq "\{"} { incr depth }
+                if {$c2 eq "\}"} { incr depth -1 }
+                incr i
+            }
+            lappend result [string range $body $start [expr {$i - 1}]]
+        } else {
+            incr i
+        }
+    }
+    return $result
+}
+
+# Extract the body of "key":[ ... ] — bracket-balanced; returns inner contents
+# (without the surrounding brackets) or "" if not found.
+proc json_get_array {json key} {
+    set pattern "\"${key}\"\\s*:\\s*\\\["
+    if {![regexp -indices $pattern $json range]} { return "" }
+    set start [lindex $range 1]
+    set depth 1
+    set i [expr {$start + 1}]
+    set len [string length $json]
+    while {$i < $len && $depth > 0} {
+        set ch [string index $json $i]
+        if {$ch eq "\["} { incr depth }
+        if {$ch eq "\]"} { incr depth -1 }
+        incr i
+    }
+    return [string range $json [expr {$start + 1}] [expr {$i - 2}]]
 }
 
 # ---- Initialise simulation ------------------------------------------- #
@@ -94,7 +160,84 @@ while {[gets stdin line] >= 0} {
     set line [string trim $line]
     if {$line eq ""} { continue }
 
-    if {[string match *"step"* $line]} {
+    if {[string match *"step_raw_trace"* $line]} {
+        # Raw batch: each input dict drives every port (including clk) with
+        # the caller-specified polarity, then advances simulation by one
+        # minimal time quantum. Mirrors clk2fflogic's SMT2 transition
+        # semantics for BMC replay.
+        set inputs_body [json_get_array $line "inputs"]
+        set objs [json_split_objs $inputs_body]
+        set states_parts {}
+        set err ""
+        foreach obj $objs {
+            if {[catch {
+                foreach {k v} [json_parse_kv $obj] {
+                    if {$k eq "{{ clock_port }}"} {
+                        set_value -radix hex /{{ module }}/{{ clock_port }} [format %llx $v]
+                    } else {
+                        set_input $k $v
+                    }
+                }
+                run {{ clock_period }}
+                lappend states_parts [emit_state_str]
+            } msg]} {
+                set err $msg
+                break
+            }
+        }
+        if {$err eq ""} {
+            puts "\{\"states\":\[[join $states_parts ,]\]\}"
+        } else {
+            set esc [string map {\\ \\\\ \" \\\"} $err]
+            puts "\{\"states\":\[[join $states_parts ,]\],\"error\":\"$esc\"\}"
+        }
+        flush stdout
+
+    } elseif {[string match *"step_raw"* $line]} {
+        set inputs_obj [json_get_object $line "inputs"]
+        if {$inputs_obj ne ""} {
+            foreach {k v} [json_parse_kv $inputs_obj] {
+                if {$k eq "{{ clock_port }}"} {
+                    set_value -radix hex /{{ module }}/{{ clock_port }} [format %llx $v]
+                } else {
+                    set_input $k $v
+                }
+            }
+        }
+        run {{ clock_period }}
+        emit_state
+
+    } elseif {[string match *"step_trace"* $line]} {
+        # Batch step: apply a list of input dicts, one clk posedge per dict,
+        # emit the state after each. On mid-batch error, emit the partial
+        # states array plus an "error" field.
+        set inputs_body [json_get_array $line "inputs"]
+        set objs [json_split_objs $inputs_body]
+        set states_parts {}
+        set err ""
+        foreach obj $objs {
+            if {[catch {
+                foreach {k v} [json_parse_kv $obj] {
+                    set_input $k $v
+                }
+                clk_posedge
+                lappend states_parts [emit_state_str]
+            } msg]} {
+                set err $msg
+                break
+            }
+        }
+        if {$err eq ""} {
+            puts "\{\"states\":\[[join $states_parts ,]\]\}"
+        } else {
+            # Escape backslashes and double quotes in the error message so the
+            # response remains valid JSON even when TCL messages contain them.
+            set esc [string map {\\ \\\\ \" \\\"} $err]
+            puts "\{\"states\":\[[join $states_parts ,]\],\"error\":\"$esc\"\}"
+        }
+        flush stdout
+
+    } elseif {[string match *"step"* $line]} {
         set inputs_obj [json_get_object $line "inputs"]
         if {$inputs_obj ne ""} {
             foreach {k v} [json_parse_kv $inputs_obj] {
@@ -107,6 +250,12 @@ while {[gets stdin line] >= 0} {
     } elseif {[string match *"reset"* $line]} {
         set cycles [json_get_int $line "cycles"]
         if {$cycles < 0} { set cycles 5 }
+        # Zero all data inputs so lingering values from a previous step do
+        # not affect the trailing post-deassertion clock edge. Callers must
+        # re-drive inputs on the next step.
+{% for inp in data_inputs %}
+        set_value -radix unsigned /{{ module }}/{{ inp.name }} 0
+{% endfor %}
 {% if reset_port %}
         set_value -radix unsigned /{{ module }}/{{ reset_port }} {{ "0" if reset_active_low else "1" }}
 {% endif %}
@@ -129,6 +278,32 @@ while {[gets stdin line] >= 0} {
             }
         }
         puts "\{\"ok\":true\}"
+        flush stdout
+
+{% if native_coverage %}
+    } elseif {[string match *"coverage"* $line]} {
+        # Flush the live xsim coverage DB to disk. Python then invokes xcrg
+        # to generate an HTML report and parses the aggregate percentages
+        # (Xilinx's code-coverage export is HTML-only).
+        set cov_dir "[pwd]/xsim_cov"
+        if {![file isdirectory $cov_dir]} { file mkdir $cov_dir }
+        if {[catch {write_xsim_coverage -cov_db_dir $cov_dir -cov_db_name {{ module }}_cov -quiet} err]} {
+            set esc [string map {\\ \\\\ \" \\\" \n \\n \r \\r} $err]
+            puts "\{\"error\":\"$esc\"\}"
+        } else {
+            puts "\{\"ok\":true,\"cov_dir\":\"$cov_dir\"\}"
+        }
+        flush stdout
+
+{% endif %}
+    } elseif {[string match *"checkpoint"* $line]} {
+        # xsim 2025.2 does not support simulator-state checkpoints; the Python
+        # side should not send this command. Return a clean error just in case.
+        puts "\{\"error\":\"checkpoint: unsupported by xsim\"\}"
+        flush stdout
+
+    } elseif {[string match *"restore"* $line]} {
+        puts "\{\"error\":\"restore: unsupported by xsim\"\}"
         flush stdout
 
     } elseif {[string match *"quit"* $line]} {

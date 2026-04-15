@@ -7,7 +7,7 @@ name = "symfuzz"
 version = "0.1.0"
 description = "Coverage-directed test generation for Verilog/SV using BMC-guided exploration"
 requires-python = ">=3.10"
-dependencies = ["jinja2"]
+dependencies = ["jinja2", "pyyaml"]
 
 [project.scripts]
 # After `pip install -e .` this creates a `symfuzz` command on PATH

@@ -60,6 +60,14 @@ class RegisterInfo:
         """
         return self.arch_name.replace('.', '/')
 
+    @property
+    def verilator_path(self) -> str:
+        """Relative verilator accessor path for this register (no ``rootp->``
+        or top-module prefix). The template prepends
+        ``rootp-><top_module>__DOT__`` when emitting the C++ expression.
+        """
+        return self.arch_name.replace('.', '__DOT__')
+
 
 @dataclass
 class DesignInfo:
@@ -68,6 +76,11 @@ class DesignInfo:
     inputs:       list[PortInfo]      = field(default_factory=list)
     outputs:      list[PortInfo]      = field(default_factory=list)
     registers:    list[RegisterInfo]  = field(default_factory=list)
+    wires:        list[PortInfo]      = field(default_factory=list)
+    """Internal (combinational) wires Yosys exposed in the SMT2 annotations.
+    Used by the orchestrator to classify coverage targets — wires that
+    aren't flop-backed get a reach-a-value BMC target rather than a flip
+    constraint."""
     clock_port:   str                 = "clk"
     reset_port:   str | None          = None
     smt2_text:    str                 = ""
@@ -257,6 +270,18 @@ def _parse_smt2_annotations(smt2_text: str, verilog_path: str) -> DesignInfo:
             if "sample_data" in name:
                 raw_registers.append((name, width))
             # skip sample_control / other auto registers
+
+        elif tag == "yosys-smt2-wire":
+            # Internal combinational wires. Yosys emits these for every
+            # named wire in the flattened netlist. We track their names +
+            # widths so the orchestrator can classify Verilator coverage
+            # points as flop-backed (use flip target) vs combinational
+            # (use reach-value target).
+            name  = parts[1] if len(parts) > 1 else ""
+            width = int(parts[2]) if len(parts) > 2 else 1
+            if name and not any(w.name == name for w in info.wires):
+                info.wires.append(PortInfo(name=name, width=width,
+                                           direction="wire"))
 
     if not info.module_name:
         raise RuntimeError("SMT2 has no yosys-smt2-module annotation")

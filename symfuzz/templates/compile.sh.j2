@@ -14,6 +14,16 @@ xvlog -sv "{{ f }}"
 {% endfor %}
 
 # Step 2: Elaborate — enable full debug access for get_value / set_value
+{% if native_coverage %}
+# Native code coverage (statement + toggle) enabled by --native-coverage.
+# xelab flags: --cc_type takes one or more of s/b/c/t.
+COV_DIR="$(pwd)/xsim_cov"
+mkdir -p "$COV_DIR"
+xelab -debug all -top "$TOP" -snapshot "$SNAPSHOT" \
+      --cc_type st \
+      --cov_db_dir "$COV_DIR" --cov_db_name "${TOP}_cov"
+{% else %}
 xelab -debug all -top "$TOP" -snapshot "$SNAPSHOT"
+{% endif %}
 
 echo "[symfuzz] Snapshot ready: ${SNAPSHOT}"
