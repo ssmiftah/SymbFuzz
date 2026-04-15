@@ -13,7 +13,6 @@ The tool is built for **RTL security fuzzing**: finding states and input pattern
 - **Structured stimuli** — pinned-port seed injection (and optional cross-product) drives datapath extremes deterministically.
 - **Value-class coverage** — optional secondary metric that tracks how many *distinct operand classes* each bin has been hit under, not just "hit once."
 - **Differential modes** — Python predicate plugins for spec-level checks; Verilator↔xsim cross-check for simulator-disagreement hunting.
-- **Parallel ablation** — shell runner that pins one campaign per CPU block for multi-arm sweeps on many-core hosts.
 
 ## Quickstart
 
