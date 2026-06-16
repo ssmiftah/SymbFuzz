@@ -4,9 +4,10 @@ bmc_interface.py — Subprocess wrapper around the compiled symbfuzz BMC binary.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +41,32 @@ class BmcInterface:
         self.total_calls: int = 0
         # Append-only per-call log. Set via open_log(); closed via close_log().
         self._log_fh = None
+        # Cached libz3.so directory (None means "lookup not yet attempted").
+        self._z3_lib_dir: Optional[str] = None
+
+    @staticmethod
+    def _detect_z3_lib_dir() -> Optional[str]:
+        """Locate a directory containing libz3.so. Tries (in order):
+          1. SYMFUZZ_Z3_LIB env var (explicit override).
+          2. The pip-installed z3-solver package bundled with this venv.
+          3. ldconfig cache.
+        Returns None if libz3 is already resolvable by the system loader."""
+        override = os.environ.get("SYMFUZZ_Z3_LIB")
+        if override and Path(override, "libz3.so").exists():
+            return override
+        try:
+            import z3 as _z3
+            cand = Path(_z3.__file__).parent / "lib"
+            if (cand / "libz3.so").exists():
+                return str(cand)
+        except Exception:
+            pass
+        return None
+
+    def _find_z3_lib_dir(self) -> Optional[str]:
+        if self._z3_lib_dir is None:
+            self._z3_lib_dir = self._detect_z3_lib_dir() or ""
+        return self._z3_lib_dir or None
 
     def open_log(self, path: str) -> None:
         """Open an append-only JSONL log that records every BMC invocation."""
@@ -101,12 +128,23 @@ class BmcInterface:
         if self.verbose:
             print(f"[bmc] {' '.join(cmd)}")
 
+        # The BMC binary dynamically links libz3.so. If it's not on the
+        # system loader path, look it up in the pip-installed z3-solver
+        # package and prepend its directory to LD_LIBRARY_PATH for this
+        # subprocess only. Cached on the instance after the first hit.
+        env = os.environ.copy()
+        z3_lib = self._find_z3_lib_dir()
+        if z3_lib:
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = (z3_lib + ":" + existing) if existing else z3_lib
+
         t0 = time.monotonic()
         try:
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
+                env=env,
                 # Kill buffer scales with the budget: 20% of timeout, clamped
                 # to [2s, 10s]. Short tier-0 budgets would otherwise get a
                 # flat +10s that dominates actual solve time.

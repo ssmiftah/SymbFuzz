@@ -20,6 +20,12 @@ from .base import BaseStdioDriver, CoverageSnapshot
 class VerilatorDriver(BaseStdioDriver):
     backend_name = "verilator"
 
+    # Coverage-universe hierarchy patterns to exclude. Useful for
+    # wrapper-based fuzz setups where the wrapper introduces aliased
+    # struct repackaging signals that inflate the bin count. Set via
+    # VerilatorDriver.coverage_exclude_hier (list of fnmatch patterns).
+    coverage_exclude_hier: list[str] = []
+
     def collect_coverage(self) -> Optional[CoverageSnapshot]:
         resp = self._send({"cmd": "coverage"})
         if "error" in resp:
@@ -30,7 +36,10 @@ class VerilatorDriver(BaseStdioDriver):
         if not report:
             return None
         top = getattr(self.design, "module_name", None)
-        return _parse_verilator_cov_dat(report, top_module=top)
+        return _parse_verilator_cov_dat(
+            report, top_module=top,
+            exclude_hier=self.coverage_exclude_hier,
+        )
 
     @staticmethod
     def _check_installed() -> str:
@@ -121,7 +130,11 @@ _FIELD_RE = re.compile(r"\x01([^\x02]+)\x02([^\x01]*)")
 _COV_LINE_RE = re.compile(r"^C '([^']*)'\s+(\d+)\s*$", re.MULTILINE)
 
 
-_OBJ_BIT_RE = re.compile(r"^(\w[\w$.]*?)\[(\d+)\]$")
+# Verilator's `o` field for toggle bins is `<sig>[<bit>]` on older builds and
+# `<sig>[<bit>]:0->1` / `:1->0` on newer ones (which split rise/fall into
+# separate cov.dat rows). The third capture group, when present, names the
+# direction so we don't double-emit rise+fall for that bin.
+_OBJ_BIT_RE = re.compile(r"^(\w[\w$.]*?)\[(\d+)\](?::(0->1|1->0))?$")
 
 
 def _fully_qualified(hier: str, sig: str, top_module: str | None) -> str:
@@ -140,7 +153,11 @@ def _fully_qualified(hier: str, sig: str, top_module: str | None) -> str:
 
 
 def _parse_verilator_cov_dat(text: str,
-                             top_module: str | None = None) -> CoverageSnapshot:
+                             top_module: str | None = None,
+                             exclude_hier: list[str] | None = None,
+                             ) -> CoverageSnapshot:
+    import fnmatch
+    excl = list(exclude_hier or [])
     snap = CoverageSnapshot()
     total = 0
     for m in _COV_LINE_RE.finditer(text):
@@ -156,21 +173,36 @@ def _parse_verilator_cov_dat(text: str,
         o    = fields.get("o", "?")
         h    = fields.get("h", "?")
 
+        # Config-aware filter: drop bins whose hierarchy matches a user
+        # exclude pattern (fnmatch). Used to strip wrapper-introduced
+        # aliased signals and dead-config paths from the universe.
+        if excl and any(fnmatch.fnmatch(h, p) for p in excl):
+            continue
+
         if page == "v_toggle":
-            # Parse "name[bit]" → (name, bit). Aggregate rows ("clk") fall
-            # back to bit=0 (the only bit of a 1-bit signal).
+            # Parse the `o` field. Three cases:
+            #  "name[bit]"              → split sig/bit, emit both rise+fall
+            #  "name[bit]:0->1"         → split sig/bit/rise, one PID only
+            #  "name[bit]:1->0"         → split sig/bit/fall, one PID only
+            #  anything else            → aggregate; bit=0, both directions.
             m2 = _OBJ_BIT_RE.match(o)
             if m2:
                 sig_raw, bit = m2.group(1), int(m2.group(2))
+                dir_suffix = m2.group(3)
             else:
                 sig_raw, bit = o, 0
+                dir_suffix = None
             reg_fq = _fully_qualified(h, sig_raw, top_module)
 
-            # Emit two point IDs per bit — :rise and :fall — matching the
-            # xsim xtgl schema. Verilator's cov.dat doesn't split rise/fall
-            # in the hit count, so both halves move in lockstep: either
-            # both covered or both uncovered.
-            for direction, val in (("rise", 1), ("fall", 0)):
+            if dir_suffix == "0->1":
+                dirs = (("rise", 1),)
+            elif dir_suffix == "1->0":
+                dirs = (("fall", 0),)
+            else:
+                # Old Verilator schema: aggregate hit count covers both edges.
+                dirs = (("rise", 1), ("fall", 0))
+
+            for direction, val in dirs:
                 pid = f"xtgl:{h}:{sig_raw}:{bit}:{direction}"
                 snap.universe.add(pid)
                 snap.kinds[pid] = "toggle"

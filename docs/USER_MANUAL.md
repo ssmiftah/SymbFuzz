@@ -227,6 +227,29 @@ Structured extreme-value bursts injected before the main loop.
 | `--predicate-module PATH` | (none) | *(Diff mode 1.)* Load a Python file defining `check(state, inputs) -> bool | None`; violations are logged to `violations.jsonl`. |
 | `--differential-cross-sim / --no-differential-cross-sim` | off | *(Diff mode 3.)* Mirror every step to the alternate backend (Verilator↔xsim); log divergences to `differential.jsonl`. |
 
+### 4.10 Adaptive input biasing
+
+Coverage-driven, per-port frequency biasing. Generic across designs — no spec, no RTL parsing, no per-design config. See ARCHITECTURE.md §10 for the model. Most useful on fuzz-dominated designs (control protocols, decoders, arithmetic blocks); marginal-to-negative on BMC-dominated designs (CSR-style modules).
+
+| Flag | Default | What |
+|------|---------|------|
+| `--adaptive-input-bias / --no-adaptive-input-bias` | off | Master toggle. Falls through to uniform random when off. |
+| `--adaptive-input-bias-explore F` | `0.3` | Base epsilon-greedy exploration rate. Per-port rate is derived from this via a width-aware curve (narrow ports exploit harder, wide ports stay near-uniform). |
+| `--adaptive-input-bias-recency F` | `0.95` | Recency-weighting alpha for credit attribution. Lower = more credit to the most recent draws. `0.95` ≈ half-life 14 draws; `0.9` ≈ 7 draws; `>=1.0` disables recency weighting (uniform credit across the window). |
+
+The model's learned per-port distributions are written to `<output-dir>/adaptive_bias.json` at the end of the campaign. The banner line `Adaptive bias: N ports learned; 'P' has K distinct credited values` summarises it.
+
+### 4.11 Dead-signal filter
+
+After native-coverage growth has stalled for a configurable number of cycles, signals whose every toggle bin remains uncovered are blacklisted from BMC targeting in one batch. Catches whole categories of structurally unreachable bins (disabled extensions, upper-bit padding) without wasting one BMC call per dead bin. Generic; on by default.
+
+| Flag | Default | What |
+|------|---------|------|
+| `--dead-signal-filter / --no-dead-signal-filter` | on | Master toggle. |
+| `--dead-signal-stall-cycles N` | `500` | Cycles without new native coverage before detection fires. Higher = more conservative. |
+
+The end-of-campaign banner line `Dead-signal flt: N signals / M bins blacklisted from BMC targeting` reports how much of the universe was filtered.
+
 ---
 
 ## 5. Output artefacts

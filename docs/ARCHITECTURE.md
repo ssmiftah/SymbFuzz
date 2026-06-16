@@ -63,6 +63,7 @@ Inside the orchestrator process:
 | `state_forcing.py` | Helper that uses BMC + the driver's `force` command to pin internal registers. |
 | `mutations.py` | Havoc- and splice-style input mutation operators. |
 | `value_classes.py` | Classifier, signature generator, and missing-signature helpers for value-class coverage. |
+| `input_bias.py` | Coverage-driven adaptive input bias model (see §11). |
 | `testbench_gen.py` | Emits a UVM scaffold for offline reuse of the corpus. |
 | `templates/` | Jinja2 templates for the Verilator C++ harness, the xsim TCL bridge, and UVM glue. |
 
@@ -149,6 +150,14 @@ On BMC None (UNSAT/timeout), the point's tier is incremented. If the point is al
 
 The target-selection query sorts candidates by tier ascending, so the orchestrator drains the tier-0 pool first before escalating anything. This makes short campaigns productive and reserves deep-solver time for genuine corner cases.
 
+### 5.1 Dead-signal filter
+
+A second, coarser layer of target pruning runs proactively on every coverage poll. After native-coverage growth has stalled for `--dead-signal-stall-cycles` cycles (default 500), `coverage_db.detect_dead_signals()` scans the universe for signals where **every** toggle bin remains uncovered. Each such signal's bins are added to the `_exhausted_coverage_points` set in one batch, removing them from future BMC targeting.
+
+This catches whole categories of structurally unreachable bins — disabled extensions, parameter-gated dead paths, upper-bit padding on sparse registers — in one sweep rather than one wasted BMC call at a time. The trigger is **coverage stall**, not raw cycle count, so BMC's full natural lifecycle is given to anything reachable before we declare anything dead.
+
+The filter is on by default (`--dead-signal-filter`) and the end-of-campaign banner reports how many signals and bins were blacklisted.
+
 ---
 
 ## 6. Seed stimuli
@@ -198,7 +207,22 @@ None requires a reference model, which makes them practical for security researc
 
 ---
 
-## 10. The SimDriver abstraction
+## 10. Adaptive input biasing (optional)
+
+When `--adaptive-input-bias` is on, the orchestrator's `_random_inputs()` consults `input_bias.InputBiasModel` instead of drawing each port uniformly. The model is purely coverage-driven — no RTL parsing, no spec, no per-design configuration.
+
+The mechanism:
+
+1. **Sample.** For each data-input port, draw either a uniform random value (with per-port probability `explore_per_port[name]`) or a value weighted by accumulated credit. Width-aware curve: narrow control ports (≤4 bits) sit at ~0.12 explore (aggressive exploitation), 8–12 bit ports at ~0.24, and wide data ports (≥32 bits) at ~0.85 (near-uniform random — the model can't learn meaningful structure across 2³² values).
+2. **Record.** Every draw is appended to a sliding window of recent input dicts.
+3. **Credit.** On every native-coverage poll, the window is closed and any new bins observed since the last poll are distributed across its entries with **recency-weighted credit** (exponential decay over the window, half-life ~14 draws). Recent draws receive most of the credit because the input most likely responsible for a newly-covered bin is one of the most recent ones, not one from 300 cycles back.
+4. **Decay.** Every 100 polls, all credit values are multiplied by 0.95 so stale values fade out as the design's reachable bins saturate.
+
+Useful for **fuzz-dominated designs** (no BMC, or BMC contributes little) where the random-input distribution dominates which bins get hit — typical control protocols (UART, AXI handshakes), arithmetic blocks, instruction decoders. For BMC-dominated designs (CSR-style modules where BMC produces most coverage), the random fuzz is background filler and biasing it has negligible or slightly negative impact.
+
+---
+
+## 11. The SimDriver abstraction
 
 Every backend exposes the same JSON-over-stdio protocol:
 
@@ -220,7 +244,7 @@ The Python side (`drivers/base.py`) implements this as `SimDriver`; subclasses (
 
 ---
 
-## 11. Concurrency
+## 12. Concurrency
 
 One orchestrator, one driver process, one BMC subprocess (spawned per call). The orchestrator is **single-threaded Python**. BMC calls are blocking subprocesses; during a BMC call, no simulation happens.
 
@@ -228,7 +252,7 @@ For multi-arm ablation experiments, the tool does **not** run multiple campaigns
 
 ---
 
-## 12. Extension points
+## 13. Extension points
 
 The following places are designed to be extended:
 
@@ -240,7 +264,7 @@ The following places are designed to be extended:
 
 ---
 
-## 13. Non-goals
+## 14. Non-goals
 
 - **Multi-clock domains.** Every cycle is a single clock edge.
 - **Spec discovery / assertion synthesis.** The differential modes consume predicates; they don't discover them.

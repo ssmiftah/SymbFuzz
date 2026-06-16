@@ -81,6 +81,12 @@ class Orchestrator:
         value_class_bias_every: int = 2000,      # every N cycles
         predicate_module:      Optional[str] = None,  # differential mode 1
         differential_cross_sim: bool = False,    # differential mode 3
+        adaptive_input_bias:   bool = False,
+        adaptive_input_bias_explore: float = 0.3,
+        adaptive_input_bias_recency: float = 0.95,
+        dead_signal_filter:   bool = True,
+        dead_signal_stall_cycles: int = 500,
+        dead_signal_recheck_every: int = 20,
     ):
         self.design         = design
         self.driver         = driver
@@ -115,7 +121,14 @@ class Orchestrator:
             [(32, 5_000), (64, 15_000), (128, 60_000)]
         )
         self.seed_stimuli = bool(seed_stimuli)
-        self.seed_cycles  = max(1, int(seed_cycles))
+        # Auto-scale seed_cycles: if the user didn't override (default 80),
+        # use 2 × max register width so deep sequential ops (e.g. 64-cycle
+        # division) have time to propagate extremes to output registers.
+        if seed_cycles == 80 and design.registers:
+            max_w = max(r.width for r in design.registers)
+            self.seed_cycles = max(80, 2 * max_w)
+        else:
+            self.seed_cycles = max(1, int(seed_cycles))
         self.bmc_target_rarity     = bool(bmc_target_rarity)
         self.bmc_corpus_precheck   = bool(bmc_corpus_precheck)
         self.seed_cross_product    = bool(seed_cross_product)
@@ -153,6 +166,30 @@ class Orchestrator:
         self._rng           = random.Random()
         self._batches_since_poll = 0
 
+        # Coverage-driven adaptive input biasing (see input_bias.py). When
+        # off, _random_inputs falls through to uniform random.
+        self._bias_model = None
+        if adaptive_input_bias:
+            from .input_bias import InputBiasModel
+            port_widths = {p.name: p.width for p in design.data_inputs}
+            self._bias_model = InputBiasModel(
+                port_widths=port_widths,
+                rng=self._rng,
+                explore_rate=float(adaptive_input_bias_explore),
+                recency_alpha=float(adaptive_input_bias_recency),
+            )
+        # Dead-signal filter: re-run dead-signal detection every N polls
+        # once the warmup threshold is met, marking those signals'
+        # toggle bins as exhausted so the BMC target picker skips them.
+        self.dead_signal_filter         = bool(dead_signal_filter)
+        self.dead_signal_stall_cycles   = max(0, int(dead_signal_stall_cycles))
+        self.dead_signal_recheck_every  = max(1, int(dead_signal_recheck_every))
+        self._dead_polls_since_check    = 0
+        self._dead_signals_marked: set[str] = set()
+        # Cumulative count of bins blacklisted (tracked live because the
+        # DB is closed by the time the end-of-run banner formats).
+        self._dead_bins_blacklisted: int = 0
+
         # RLE log of inputs applied since the last reset/restore. Drives corpus
         # entries. Lossless run-length encoding on the applied input stream.
         self.current_path: list[RLESegment] = []
@@ -163,8 +200,13 @@ class Orchestrator:
 
     def _random_inputs(self) -> dict[str, int]:
         inputs: dict[str, int] = {}
-        for p in self.design.data_inputs:
-            inputs[p.name] = self._rng.randint(0, p.mask)
+        if self._bias_model is None:
+            for p in self.design.data_inputs:
+                inputs[p.name] = self._rng.randint(0, p.mask)
+        else:
+            for p in self.design.data_inputs:
+                inputs[p.name] = self._bias_model.sample(p.name)
+            self._bias_model.record_draw(inputs)
         if self.design.reset_port:
             rp = self.design.reset_port
             inputs[rp] = 1 if rp.endswith(("_n", "_ni", "_b")) else 0
@@ -612,17 +654,55 @@ class Orchestrator:
         if new and self.verbose:
             print(f"[orch] native coverage +{new} points "
                   f"({self.coverage_db.native_summary()})")
-        # Phase 1: attribute signatures in the current window to every
-        # newly-covered point. Coarse but cheap; poll windows are small so
-        # the attribution is tight enough for practical use.
-        if (self.value_class_coverage and new
-                and getattr(self.coverage_db, "last_new_point_ids", None)):
-            window_sigs = set(self._sig_buffer)
-            for pid in self.coverage_db.last_new_point_ids:
-                for sig in window_sigs:
-                    self.coverage_db.record_value_class_hit(
-                        pid, sig, global_cycle)
-            self.coverage_db._conn.commit()
+        # Feed back the coverage delta to the adaptive-bias model. Even
+        # zero-delta polls advance the model's poll counter (for decay
+        # scheduling) and drain the unrewarded window.
+        if self._bias_model is not None:
+            self._bias_model.credit(new)
+        # Periodic dead-signal detection. After the warmup threshold,
+        # every recheck_every polls, find signals whose every bin is
+        # still uncovered and blacklist their bins from BMC targeting.
+        if self.dead_signal_filter:
+            self._dead_polls_since_check += 1
+            if self._dead_polls_since_check >= self.dead_signal_recheck_every:
+                self._dead_polls_since_check = 0
+                fresh = self.coverage_db.detect_dead_signals(
+                    stall_cycles=self.dead_signal_stall_cycles,
+                ) - self._dead_signals_marked
+                if fresh:
+                    total_bins = 0
+                    for sig in fresh:
+                        total_bins += self.coverage_db.mark_signal_dead(sig)
+                        self._dead_signals_marked.add(sig)
+                    self._dead_bins_blacklisted += total_bins
+                    if self.verbose:
+                        print(f"[orch] dead-signal filter: "
+                              f"blacklisted {total_bins} bins on "
+                              f"{len(fresh)} signals "
+                              f"({len(self._dead_signals_marked)} total)")
+        # Phase 1: per-poll attribution of a bounded sample of window
+        # signatures to every covered bin that is still under its target.
+        # The older scheme attributed EVERY window signature to every
+        # newly-covered bin on the first poll, which saturated the metric
+        # instantly because thousands of bins covered together. Here each
+        # poll attributes at most K fresh signatures per bin and skips
+        # already-saturated bins, so diversification grows gradually as
+        # varied inputs flow through the design.
+        if self.value_class_coverage and self._sig_buffer:
+            window_sigs = list(set(self._sig_buffer))
+            k_per_poll  = 4
+            if len(window_sigs) > k_per_poll:
+                sample = self._rng.sample(window_sigs, k_per_poll)
+            else:
+                sample = window_sigs
+            under = self.coverage_db.value_class_under_target_points(
+                self.value_class_target)
+            if under:
+                for pid, _cur in under:
+                    for sig in sample:
+                        self.coverage_db.record_value_class_hit(
+                            pid, sig, global_cycle)
+                self.coverage_db._conn.commit()
         # Start a fresh attribution window after each poll.
         if self.value_class_coverage:
             self._sig_buffer.clear()
@@ -826,6 +906,12 @@ class Orchestrator:
         # restored (resumed campaign already has state).
         if not resumed and self.seed_stimuli:
             global_cycle = self._run_seed_stimuli(global_cycle)
+            # Force a native-coverage poll before resetting so seed-era
+            # toggles get recorded. Otherwise a combinational design (no
+            # registers → tuple space size 1) enters the main loop already
+            # "stalled" against a zero coverage universe and terminates
+            # before any toggle bin is observed.
+            self._poll_native_coverage(global_cycle, force=True)
             # Reset cleanly after seeds so the main loop starts from s_0.
             self.driver.reset(cycles=5)
             self.current_path = []
@@ -1072,8 +1158,13 @@ class Orchestrator:
                                 bmc_invocations, bmc_successes)
 
             # ---- Check full coverage ------------------------------------
+            # Skip tuple-state early-exit for pure combinational designs
+            # (max_state_space == 1 when no registers) — they'd terminate
+            # after the initial state record before native coverage has a
+            # chance to observe anything.
             max_s = self.design.max_state_space
-            if max_s <= (1 << 20) and self.coverage_db.total_states() >= max_s:
+            if (max_s > 1 and max_s <= (1 << 20)
+                    and self.coverage_db.total_states() >= max_s):
                 termination = "full_coverage"
                 break
             # Native-coverage completion short-circuit (works on any design

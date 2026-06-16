@@ -112,8 +112,27 @@ _RST_NAMES  = {"rst", "reset", "rst_n", "resetn", "rstn", "rst_ni",
 
 
 def _find_sv2v() -> str | None:
-    """Return the path to sv2v if it is on PATH, else None."""
-    for candidate in ("sv2v",):
+    """Return the path to a working sv2v binary, else None.
+
+    Tries (in order):
+      1. SYMFUZZ_SV2V env var (explicit override).
+      2. PATH (standard install location).
+      3. The directory of the current Python interpreter — when
+         symfuzz is invoked via ``.venv/bin/symfuzz`` without
+         activating the venv, ``sys.executable`` lives in that same
+         directory, so a sv2v binary placed alongside it is reachable
+         without requiring the user to ``source activate``.
+    """
+    import sys
+    override = os.environ.get("SYMFUZZ_SV2V")
+    candidates: list[str] = []
+    if override:
+        candidates.append(override)
+    candidates.append("sv2v")
+    venv_bin = Path(sys.executable).resolve().parent / "sv2v"
+    if str(venv_bin) not in candidates:
+        candidates.append(str(venv_bin))
+    for candidate in candidates:
         try:
             r = subprocess.run(
                 [candidate, "--version"],
@@ -291,15 +310,39 @@ def _parse_smt2_annotations(smt2_text: str, verilog_path: str) -> DesignInfo:
 
     # Pass 3: resolve arch_name from mangled sample_data names
     #   $auto$clk2fflogic...sample_data$/<signame>#sampled$N
+    #
+    # clk2fflogic emits two sample_data registers per flop (negedge +
+    # posedge of the 2-transitions-per-cycle model), so the same arch_name
+    # shows up under different `$N` suffixes. Dedup by arch_name and keep
+    # only the first occurrence — they represent the same logical storage.
+    seen_arch_names: set[str] = set()
     for mangled, width in raw_registers:
         arch_name = _extract_arch_name(mangled)
         if not arch_name:
             continue
         # Skip Yosys-internal nodes: valid RTL identifiers never contain
-        # '$', '#', or ':'.  These appear when sv2v-generated intermediate
-        # flip-flops get clk2fflogic'd (e.g. "sv2v_out.v:190$23_Y").
-        if any(c in arch_name for c in ('$', '#', ':')):
+        # '$', '#', ':'. They also can't contain '[', ']', '{', '}' for our
+        # purposes — Yosys sometimes emits packed-array element names like
+        # "vsstatus_d[1]}" that break the harness's force/read_state paths.
+        if any(c in arch_name for c in ('$', '#', ':', '[', ']', '{', '}')):
             continue
+        # Skip sv2v procedural-variable artifacts: sv2v converts SV
+        # always-block local `reg`s into named blocks like
+        # "sv2v_autoblock_<N>.<var>" that Yosys reports as registers but
+        # Verilator folds away. They're not addressable at runtime, so
+        # force/read_state would fail. Identify by the autoblock prefix.
+        if "sv2v_autoblock" in arch_name or "sv2v_tmp_" in arch_name:
+            continue
+        # Skip registers wider than 64 bits — the JSON force/read_state
+        # protocol and the Verilator harness template use uint64_t. Wider
+        # registers come from packed arrays (e.g. pmpaddr_q[64][54]) that
+        # Yosys flattens. Coverage on these still tracks toggle bins; we
+        # just can't force them directly.
+        if width > 64:
+            continue
+        if arch_name in seen_arch_names:
+            continue
+        seen_arch_names.add(arch_name)
         returns_bool = bool_map.get(mangled, width == 1)
         info.registers.append(RegisterInfo(
             arch_name=arch_name,

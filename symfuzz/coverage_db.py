@@ -382,6 +382,22 @@ class CoverageDB:
         ).fetchall()]
         return (pid, sigs)
 
+    def value_class_under_target_points(
+        self, target_n: int,
+    ) -> list[tuple[str, int]]:
+        """Return (point_id, current_sig_count) for every covered point
+        whose signature count is strictly below *target_n*. Caller uses this
+        to decide which bins still need fresh signatures each poll."""
+        rows = self._conn.execute(
+            "SELECT cp.point_id, COUNT(v.signature) AS n "
+            "FROM coverage_points cp "
+            "LEFT JOIN value_class_hits v ON v.point_id = cp.point_id "
+            "GROUP BY cp.point_id "
+            "HAVING n < ?",
+            (target_n,)
+        ).fetchall()
+        return [(pid, int(n)) for pid, n in rows]
+
     def value_class_per_point_counts(self) -> list[tuple[str, int]]:
         """Return list of (point_id, distinct_signature_count) for all
         points that have at least one recorded signature."""
@@ -414,6 +430,60 @@ class CoverageDB:
         coverage, we stop revisiting that point."""
         if point_id:
             self._exhausted_coverage_points.add(point_id)
+
+    def detect_dead_signals(self, stall_cycles: int = 500) -> set[str]:
+        """Return signal names where every toggle bin remains uncovered
+        AND the design has shown no new native coverage for at least
+        `stall_cycles` cycles.
+
+        Rationale: a signal whose every bit and every direction has
+        never toggled, even after coverage growth has plateaued (so
+        BMC has exhausted its ideas for finding new bins on what IS
+        reachable), is very likely *structurally unreachable* in the
+        current design configuration — bins under a disabled extension,
+        upper bits of a sparse register, dead-code paths gated by a
+        compile-time constant.
+
+        Tying detection to coverage stall (rather than a fixed cycle
+        threshold) gives BMC its full natural lifecycle to reach hard
+        bins before we declare anything dead. Reachable signals that
+        BMC could solve will toggle during the active coverage-growth
+        phase; only after growth has stopped do we attribute their
+        absence to actual unreachability.
+
+        Returns ``set()`` if coverage hasn't yet stalled, so this can be
+        called unconditionally on every poll.
+        """
+        if self._cycle - self._last_new_native_cycle < stall_cycles:
+            return set()
+        rows = self._conn.execute(
+            "SELECT json_extract(cpu.details_json, '$.reg') AS sig, "
+            "       SUM(CASE WHEN cp.point_id IS NULL THEN 0 ELSE 1 END) AS covered "
+            "FROM coverage_point_universe cpu "
+            "LEFT JOIN coverage_points cp ON cp.point_id = cpu.point_id "
+            "WHERE json_extract(cpu.details_json, '$.reg') IS NOT NULL "
+            "GROUP BY sig "
+            "HAVING covered = 0"
+        ).fetchall()
+        return {r[0] for r in rows if r[0]}
+
+    def mark_signal_dead(self, signal: str) -> int:
+        """Add every toggle bin associated with `signal` to the exhausted
+        set so the BMC target picker skips them. Returns the count of
+        newly-exhausted bins (0 if all were already exhausted)."""
+        if not signal:
+            return 0
+        rows = self._conn.execute(
+            "SELECT point_id FROM coverage_point_universe "
+            "WHERE json_extract(details_json, '$.reg') = ?",
+            (signal,)
+        ).fetchall()
+        n = 0
+        for (pid,) in rows:
+            if pid not in self._exhausted_coverage_points:
+                self._exhausted_coverage_points.add(pid)
+                n += 1
+        return n
 
     def get_uncovered_coverage_target(
         self, rarity_weighted: bool = False,

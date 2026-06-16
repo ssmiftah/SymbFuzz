@@ -205,6 +205,35 @@ def main(argv=None):
     ap.add_argument("--value-class-bias-every", type=int, default=2000,
                     help="Run the diversification bias pass every N cycles "
                          "(default: 2000)")
+    ap.add_argument("--adaptive-input-bias", dest="adaptive_input_bias",
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help="Bias random_step input draws toward values that "
+                         "historically correlated with coverage growth. "
+                         "Learns automatically from coverage feedback; no "
+                         "spec or RTL knowledge required.")
+    ap.add_argument("--adaptive-input-bias-explore", type=float, default=0.3,
+                    help="Epsilon-greedy exploration rate for adaptive bias: "
+                         "fraction of draws that ignore the model and sample "
+                         "uniformly (default: 0.3)")
+    ap.add_argument("--adaptive-input-bias-recency", type=float, default=0.95,
+                    help="Recency weight alpha for credit attribution. "
+                         "Lower = more credit to the most recent draws "
+                         "(default 0.95 = half-life ~14 draws; 0.9 ~ 7 "
+                         "draws; >=1.0 disables recency weighting)")
+    ap.add_argument("--dead-signal-filter", dest="dead_signal_filter",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help="After a warmup period, automatically blacklist "
+                         "toggle bins on signals where no bin has ever been "
+                         "covered. Concentrates BMC budget on reachable bins "
+                         "by skipping signals under disabled extensions / "
+                         "dead-code paths. (default: on)")
+    ap.add_argument("--dead-signal-stall-cycles", type=int, default=500,
+                    help="Cycles without new native coverage before "
+                         "dead-signal detection fires. Tying detection to "
+                         "the coverage-stall window (rather than a fixed "
+                         "cycle threshold) gives BMC its full natural "
+                         "lifecycle to reach hard bins before we declare "
+                         "anything dead. (default: 500)")
     ap.add_argument("--predicate-module", type=str, default=None,
                     help="Differential mode 1: path to a Python file "
                          "exposing check(state, inputs) -> bool | None. "
@@ -214,6 +243,11 @@ def main(argv=None):
                     help="Differential mode 3: mirror every step to a second "
                          "simulator backend (Verilator <-> xsim) and log any "
                          "state divergence to differential.jsonl.")
+    ap.add_argument("--coverage-exclude-hier", action="append", default=[],
+                    help="fnmatch pattern of hierarchies to exclude from the "
+                         "Verilator coverage universe. Useful for stripping "
+                         "wrapper-aliased signals. Repeatable; YAML can pass "
+                         "a list under coverage_exclude_hier.")
     ap.add_argument("--bmc-depth-tiers", type=str, default="32:5000,64:15000,128:60000",
                     help="Tiered (steps:ms) budgets for coverage-toggle BMC, "
                          "comma-separated. Cheap tiers run first; promotion "
@@ -404,7 +438,8 @@ def main(argv=None):
         sys.exit(1)
 
     driver = make_driver(args.sim, design, tb_dir, verbose=args.verbose,
-                         grey_bit_samples=args.grey_bit_samples)
+                         grey_bit_samples=args.grey_bit_samples,
+                         coverage_exclude_hier=args.coverage_exclude_hier)
 
     if not args.no_compile:
         if args.sim == "verilator":
@@ -427,7 +462,8 @@ def main(argv=None):
         print(f"[symfuzz] Differential cross-sim: spawning {cross_sim}")
         cross_driver = make_driver(cross_sim, design, cross_tb,
                                    verbose=args.verbose,
-                                   grey_bit_samples=args.grey_bit_samples)
+                                   grey_bit_samples=args.grey_bit_samples,
+                                   coverage_exclude_hier=args.coverage_exclude_hier)
         try:
             cross_driver.compile()
         except RuntimeError as e:
@@ -454,6 +490,18 @@ def main(argv=None):
     bmc.open_log(str(output_dir / "bmc.jsonl"))
 
     driver.load()
+    # Drop registers the simulator has folded to constants. Without this,
+    # BMC may SAT against fields that exist on the harness's struct but
+    # have no real driver in the simulation, producing replays that don't
+    # advance coverage. See BaseStdioDriver.validate_registers for the
+    # probe semantics.
+    pre_n = len(design.registers)
+    n_dropped, dropped = driver.validate_registers()
+    if n_dropped > 0:
+        sample = ", ".join(dropped[:5])
+        more = f", ... (+{n_dropped - 5} more)" if n_dropped > 5 else ""
+        print(f"[symfuzz] Dropped {n_dropped}/{pre_n} sim-folded registers: "
+              f"{sample}{more}")
     forcer = StateForcer(driver, design)
 
     # ---- Corpus / checkpoint store -------------------------------------
@@ -505,6 +553,11 @@ def main(argv=None):
         value_class_bias_every = args.value_class_bias_every,
         predicate_module       = args.predicate_module,
         differential_cross_sim = args.differential_cross_sim,
+        adaptive_input_bias    = args.adaptive_input_bias,
+        adaptive_input_bias_explore = args.adaptive_input_bias_explore,
+        adaptive_input_bias_recency = args.adaptive_input_bias_recency,
+        dead_signal_filter         = args.dead_signal_filter,
+        dead_signal_stall_cycles   = args.dead_signal_stall_cycles,
     )
 
     native_summary = None
@@ -538,6 +591,30 @@ def main(argv=None):
     print(f"  BMC invocations: {result.bmc_invocations} "
           f"({result.bmc_successes} successful)")
     print(f"  Coverage DB    : {db_path}")
+    dead_marked = getattr(orch, "_dead_signals_marked", None)
+    if dead_marked:
+        # Bin count is tracked live by the orchestrator as the filter
+        # blacklists. We can't query the DB here — it's already closed
+        # in the finally block above.
+        n_bins = getattr(orch, "_dead_bins_blacklisted", 0)
+        print(f"  Dead-signal flt: {len(dead_marked)} signals / "
+              f"{n_bins} bins blacklisted from BMC targeting")
+    if args.adaptive_input_bias and getattr(orch, "_bias_model", None) is not None:
+        s = orch._bias_model.summary(top_k=3)
+        # Write the full per-port summary to a sidecar file; print a single
+        # banner line with the most-credited port for quick eyeballing.
+        bias_path = output_dir / "adaptive_bias.json"
+        with open(bias_path, "w") as fh:
+            import json as _json
+            _json.dump(s, fh, indent=2)
+        # Pick the port with the most distinct credited values for the banner.
+        ports_with_credit = [(p, d["distinct"]) for p, d in s.items() if d["distinct"] > 0]
+        if ports_with_credit:
+            ports_with_credit.sort(key=lambda x: -x[1])
+            biggest_port, n = ports_with_credit[0]
+            print(f"  Adaptive bias  : {len(ports_with_credit)} ports learned;"
+                  f" '{biggest_port}' has {n} distinct credited values"
+                  f" (full table: {bias_path})")
     print("=" * 60)
 
 

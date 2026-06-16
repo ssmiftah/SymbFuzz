@@ -190,3 +190,88 @@ class BaseStdioDriver:
             rp = self.design.reset_port
             inputs[rp] = 1 if rp.endswith(("_n", "_ni", "_b")) else 0
         return self.step(inputs)
+
+    # ---- Runtime register-validity probe ----------------------------- #
+
+    def validate_registers(self) -> tuple[int, list[str]]:
+        """Drop registers that the simulator has folded into stub variables.
+
+        Verilator's --public-flat-rw exposes every flop field on the
+        rootp struct, so the harness compiles regardless of whether the
+        flop is genuinely modeled or has been folded to a constant by
+        optimization (e.g. parameter-gated dead paths from
+        ``if (CFG.X)`` with X=0). Folded fields are writable from C++
+        but the simulation ignores them — force_state writes a residual
+        variable nothing reads from, and reset cycles don't drive it.
+        BMC SAT witnesses against such registers replay without coverage
+        motion.
+
+        Detection — reset-response: force all registers to two
+        complementary non-zero patterns, run ``reset()`` after each
+        force, and read back. Real flops have their always_ff reset
+        clauses connected to rst_n, so reset overrides the forced
+        value (typically driving it to 0 or to the design's reset
+        constant). A folded stub doesn't respond to reset because the
+        simulator has no driver wired to the variable — it retains the
+        forced bits verbatim. Require BOTH patterns to leak through
+        unchanged to flag the register as dead, ruling out designs
+        where the reset constant happens to equal one pattern.
+
+        Reset is preferred over random stepping because hold-on-no-op
+        flops (e.g. CSR registers whose write enable rarely fires) look
+        indistinguishable from folded stubs under random stimulation —
+        both retain the forced value. Reset, by contrast, is mandatory
+        sensitivity for any modeled flop.
+
+        Caller contract: invoke once immediately after ``load()``.
+        Leaves the design in reset.
+        """
+        regs = list(self.design.registers)
+        if not regs:
+            return 0, []
+        # Without a reset port the leak-detection criterion (reset
+        # overrides forced bits) is meaningless: reset() becomes a
+        # no-op so EVERY register's value would "leak through" and we'd
+        # drop the entire list. Skip the probe in that case.
+        if not self.design.reset_port:
+            return 0, []
+
+        ALT_LO = 0x5555_5555_5555_5555
+        ALT_HI = 0xAAAA_AAAA_AAAA_AAAA
+        patterns: list[dict[str, int]] = [
+            {r.arch_name: r.mask                for r in regs},  # all-ones
+            {r.arch_name: r.mask & ALT_LO       for r in regs},  # 0101...
+            {r.arch_name: r.mask & ALT_HI       for r in regs},  # 1010...
+        ]
+
+        # Per-register: count how many patterns survived reset intact.
+        leak_count = {r.arch_name: 0 for r in regs}
+        for pat in patterns:
+            # Force *before* reset: the force write happens between
+            # cycles, reset() then drives the design through several
+            # rst-asserted clock edges. A real flop's reset clause
+            # latches the design's reset constant; a folded stub holds
+            # whatever bits we wrote.
+            self.force(pat)
+            self.reset()
+            state = self.read_state()
+            for r in regs:
+                v = state.get(r.arch_name)
+                if v is None:
+                    leak_count[r.arch_name] += 1
+                    continue
+                if v == pat[r.arch_name]:
+                    leak_count[r.arch_name] += 1
+
+        alive: list = []
+        dead: list[str] = []
+        threshold = len(patterns)  # require ALL patterns to leak
+        for r in regs:
+            if leak_count[r.arch_name] >= threshold:
+                dead.append(r.arch_name)
+            else:
+                alive.append(r)
+
+        self.design.registers = alive
+        self.reset()
+        return len(dead), dead

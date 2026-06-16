@@ -204,6 +204,12 @@ Reads the current tier (default 0).
 #### `mark_coverage_point_exhausted(point_id)`
 Adds `point_id` to `_exhausted_coverage_points`, permanently excluding it from target selection.
 
+#### `detect_dead_signals(stall_cycles=500) -> set[str]`
+Returns signal names where every toggle bin remains uncovered, but only after the design has shown no new native coverage for `stall_cycles` cycles. Used by the orchestrator's dead-signal filter (ARCHITECTURE.md §5.1). Tying the trigger to coverage stall (rather than a fixed cycle threshold) gives BMC its full natural lifecycle to reach hard bins before any signal is declared dead. Returns `set()` if coverage hasn't yet stalled, so it can be called unconditionally each poll.
+
+#### `mark_signal_dead(signal) -> int`
+Adds every toggle bin associated with `signal` to `_exhausted_coverage_points`. Returns the count of newly-exhausted bins (0 if they were already in the set). Called by the orchestrator immediately after `detect_dead_signals` finds new dead signals.
+
 #### `get_uncovered_coverage_target(rarity_weighted=False) -> dict | None`
 The core target-picker. Builds a candidate list from `coverage_point_universe \ coverage_points`, excluding exhausted points. Sorts by tier ascending, then (if rarity-weighted) by negative sibling-coverage count, then random. Returns the winner with its kind, details, `point_id`, and `tier` attached.
 
@@ -226,6 +232,9 @@ Dataclass: `depth`, `steps` (list of per-step input dicts), `target`.
 
 #### `__init__(binary, design, max_steps, timeout_ms, verbose)`
 Stores defaults and accumulator stats (`last_duration_ms`, `total_duration_ms`, `total_calls`). Opens no log file by default.
+
+#### `_detect_z3_lib_dir() -> Optional[str]` / `_find_z3_lib_dir()`
+Locate a directory containing `libz3.so` so the BMC subprocess can dynamically link it without the user activating a venv. Tries (in order) the `SYMFUZZ_Z3_LIB` env override, the pip-installed `z3-solver` package's bundled `.so` (resolved via `import z3; Path(z3.__file__).parent / "lib"`), and falls back to the system loader. Cached on the instance after first lookup. The resolved directory is prepended to `LD_LIBRARY_PATH` for each `subprocess.run` call.
 
 #### `open_log(path)` / `close_log()` / `_log_record(rec)`
 Appends one JSON-per-line record per BMC call to `bmc.jsonl`. Safe to call without opening (no-ops if no fh).
@@ -265,7 +274,7 @@ Per-register metadata. `arch_name` (human name), `mangled_name` (from Yosys), `w
 Holds ports, registers, module name, clock/reset names, Verilog paths, optional sv2v cache path. `data_inputs` property filters ports to exclude clock/reset. `max_state_space` is the product of `2**width` over registers.
 
 ### `_find_sv2v() -> str | None`
-Searches `$PATH` for the `sv2v` binary.
+Locates a working `sv2v` binary. Tries (in order) the `SYMFUZZ_SV2V` env override, `$PATH`, and the directory of the current Python interpreter — so a `sv2v` placed in `.venv/bin/` alongside `python3` is reachable without activating the venv. Returns the first candidate whose `--version` succeeds.
 
 ### `_sv2v_convert(files, top_module, out_path) -> list[str]`
 Runs `sv2v` on the input files, writes the flattened Verilog-2005 output to `out_path`. Returns a single-element list containing `out_path`.
@@ -274,7 +283,13 @@ Runs `sv2v` on the input files, writes the flattened Verilog-2005 output to `out
 Main entry point. Optionally preprocesses with sv2v, invokes Yosys to emit SMT2 annotations, parses those annotations to extract ports and registers, returns a populated `DesignInfo`.
 
 ### `_parse_smt2_annotations(smt2_text, verilog_path) -> DesignInfo`
-Walks Yosys's SMT2 output looking for `; yosys-smt2-input` / `-output` / `-register` comments, plus the Boolean-width annotations. Builds the typed metadata.
+Walks Yosys's SMT2 output looking for `; yosys-smt2-input` / `-output` / `-register` / `-wire` comments, plus the Boolean-width annotations. Builds the typed metadata.
+
+Register selection applies several filters before promoting a Yosys sample_data entry to a `RegisterInfo`:
+- Reject Yosys-internal mangled names containing `$`, `#`, `:`, `[`, `]`, `{`, `}` (valid RTL identifiers never contain these; Yosys sometimes emits packed-array element names that break force/read paths).
+- Reject sv2v procedural-variable artifacts (`sv2v_autoblock_<N>.<var>`, `sv2v_tmp_*`) — Yosys lists them as registers but Verilator folds them.
+- Drop registers wider than 64 bits — the JSON force/read protocol uses `uint64_t`. Coverage on these still tracks toggle bins; just can't be forced directly.
+- **Dedup by `arch_name`** — `clk2fflogic` emits two sample_data registers per flop (negedge + posedge transitions in its 2-transitions-per-cycle model), so the same logical storage shows up twice under different `$N` suffixes. The parser keeps the first occurrence and drops the duplicate.
 
 ### `_extract_arch_name(mangled)` / `_build_bool_map(smt2_text, module)`
 Internal helpers for de-mangling Yosys names and finding Boolean-typed (width-1) registers.
@@ -307,6 +322,7 @@ Shared infrastructure for the JSON-over-stdio protocol.
 - `checkpoint(path)` / `restore(path)` — waveform snapshot; Verilator only.
 - `collect_coverage()` — returns a `CoverageSnapshot` or `None`.
 - `random_step(deassert_reset=True)` — convenience for deterministic random walks.
+- `validate_registers() -> (n_dropped, dead_names)` — reset-response probe that drops registers the simulator has folded into stub variables. For each of three complementary patterns (all-ones, 0x5555…, 0xAAAA…), the method forces all registers to the pattern, runs `reset()`, and reads back. Real flops respond to reset (their always_ff reset clause overrides the forced value); folded stubs retain the forced bits because the simulator has no driver wired to the variable. Requires all three patterns to leak through unchanged to flag the register as dead, ruling out designs whose reset constant happens to equal one pattern. No-op when the design has no reset port. Called once by `cli.py` immediately after `driver.load()`.
 
 ### `symfuzz/drivers/verilator.py`
 Concrete Verilator backend. Renders the C++ harness template, invokes Verilator to build a binary, spawns it and speaks JSON to it. Native coverage is parsed from `verilator_cov.dat` by `_parse_verilator_cov_dat`, which de-duplicates toggle bits into one `xtgl:HIER:SIG:BIT:DIR` point per direction and attaches details `{reg, bit, dir, file, line}`.
@@ -371,13 +387,36 @@ Value-class coverage helpers.
 
 ---
 
-## 11. `symfuzz/testbench_gen.py`
+## 11. `symfuzz/input_bias.py`
+
+Coverage-driven adaptive input bias model used by the orchestrator's `_random_inputs()` when `--adaptive-input-bias` is on. Pure mechanism — no RTL parsing, no spec knowledge, no per-design configuration.
+
+### `class InputBiasModel`
+
+- `__init__(port_widths, rng, explore_rate=0.3, decay_factor=0.95, decay_every=100, window_cap=2048, recency_alpha=0.95)`
+    Builds per-port masks and a per-port explore-rate table via a width-aware curve: widths ≤4 → `max(0.05, base*0.4)`, ≤12 → `base*0.8`, ≤24 → `min(0.9, base*1.5)`, else `max(base, 0.85)`. The curve makes narrow control ports exploit aggressively while wide data ports stay near-uniform.
+
+- `sample(port) -> int`
+    Hot path: returns `rng.randint(0, mask)` when (a) the port's table is empty (cold start) or (b) the per-port epsilon-greedy coin lands; otherwise picks weighted by accumulated credit via `rng.choices`.
+
+- `record_draw(inputs)`
+    Stashes the relevant subset of `inputs` in a `collections.deque(maxlen=window_cap)`. Called once per `_random_inputs()` call.
+
+- `credit(new_bins)`
+    Called by `Orchestrator._poll_native_coverage` with the count of newly-covered points. Distributes credit across the window with **recency weighting**: weight at position `i` is proportional to `recency_alpha ** (K-1-i)` for window size K. With `recency_alpha=0.95`, the half-life is ~14 draws, meaning the last ~30 draws receive ~80% of the credit. Zero-delta polls drain the window without credit so future bursts aren't mis-attributed to stale draws. Decays every `decay_every` polls.
+
+- `summary(top_k=3) -> dict`
+    Compact per-port view (distinct value count, explore rate, top-k by credit). Serialised to `adaptive_bias.json` and used in the end-of-campaign banner.
+
+---
+
+## 12. `symfuzz/testbench_gen.py`
 
 Emits a UVM scaffold (`tb_top.sv`, agent/driver/monitor/sequence/environment, packages) from the templates in `symfuzz/templates/uvm_*.sv.j2`. The scaffold is independent of the campaign loop; users can drop it into any UVM-capable simulator to replay corpus paths.
 
 ---
 
-## 12. `symfuzz/templates/`
+## 13. `symfuzz/templates/`
 
 Jinja2 templates. These are rendered once per campaign into the output directory.
 
@@ -389,7 +428,7 @@ Jinja2 templates. These are rendered once per campaign into the output directory
 
 ---
 
-## 13. `src/` — the C++ BMC binary
+## 14. `src/` — the C++ BMC binary
 
 The binary is built out-of-tree under `build/` via `cmake`/`make`.
 
@@ -415,7 +454,7 @@ Generic helpers: JSON emission, logging, CLI option parsing.
 
 ---
 
-## 14. Data exchange formats
+## 15. Data exchange formats
 
 ### 14.1 Simulator JSON protocol
 
@@ -468,7 +507,7 @@ One record per BMC call: `{t, outcome, target, kind, duration_ms, depth, rc?}` p
 
 ---
 
-## 15. Testing hooks
+## 16. Testing hooks
 
 ### 15.1 The `force` path
 `driver.force()` is the only way to reach "otherwise unreachable" states outside a BMC witness. `state_forcing.py` wraps it for disciplined use; bare `driver.force()` is available for ad-hoc tests.

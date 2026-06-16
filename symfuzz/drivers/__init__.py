@@ -17,6 +17,7 @@ def make_driver(
     tb_dir:  str | Path,
     verbose: bool = False,
     grey_bit_samples: int = 4,
+    coverage_exclude_hier: list[str] | None = None,
 ):
     if backend == "xsim":
         from .xsim import XsimDriver
@@ -24,7 +25,10 @@ def make_driver(
                           grey_bit_samples=grey_bit_samples)
     if backend == "verilator":
         from .verilator import VerilatorDriver
-        return VerilatorDriver(design, tb_dir, verbose)
+        drv = VerilatorDriver(design, tb_dir, verbose)
+        if coverage_exclude_hier:
+            drv.coverage_exclude_hier = list(coverage_exclude_hier)
+        return drv
     raise ValueError(f"unknown --sim backend: {backend!r} "
                      f"(expected 'xsim' or 'verilator')")
 
