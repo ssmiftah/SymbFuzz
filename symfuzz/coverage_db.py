@@ -53,6 +53,10 @@ class CoverageDB:
         # Per-point BMC tier (0 = cheapest). Promoted on timeout/UNSAT at
         # non-top tier; retired via _exhausted_coverage_points at top tier.
         self._point_tier: dict[str, int] = {}
+        # Signal-level dead set, populated by mark_signal_dead. Shared
+        # between the coverage-target picker and the register-target
+        # picker so both layers respect the dead-signal filter.
+        self._dead_signals: set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Schema                                                               #
@@ -192,13 +196,20 @@ class CoverageDB:
         Suggest a single-register constraint ``{arch_name: value}`` that has NOT
         yet been seen in the coverage database.  Iterates registers in round-robin
         order across calls.  Returns ``None`` when full coverage is achieved.
+
+        Filters out registers whose signal name is in ``_dead_signals``
+        (populated by the dead-signal filter via :meth:`mark_signal_dead`).
+        Without this, the picker would keep selecting dead-extension
+        registers (e.g. accelerator regs when the coproc is disabled),
+        burning BMC budget on guaranteed timeouts.
         """
         all_rows = self._conn.execute(
             "SELECT state_json FROM visited_states"
         ).fetchall()
         visited_states = [json.loads(r[0]) for r in all_rows]
 
-        registers = self.design.registers
+        registers = [r for r in self.design.registers
+                     if r.arch_name not in self._dead_signals]
         if not registers:
             return None
 
@@ -410,15 +421,76 @@ class CoverageDB:
     def promote_coverage_point(self, point_id: str, max_tier: int) -> bool:
         """Bump *point_id* one BMC-budget tier. Returns True if the point is
         still within *max_tier* (i.e. promotion succeeded); False if the next
-        tier would exceed max — caller should blacklist instead."""
+        tier would exceed max — caller should blacklist instead.
+
+        Suppresses promotion when the point's parent signal is in the
+        "narrow-effective" set (see :meth:`_narrow_effective_signals`).
+        Uncovered bins on such signals are structurally dead RTL padding
+        — the register was declared 64-bit but only a handful of bits
+        are functional (icache_q, mie_q, medeleg_q high bits, etc.).
+        Promoting past tier-0 costs 15-60s per bin × hundreds of dead
+        bins per signal; suppressing promotion saves hours of wall-clock
+        while still giving each bin one tier-0 attempt.
+        """
         if not point_id:
             return False
         cur = self._point_tier.get(point_id, 0)
         nxt = cur + 1
         if nxt > max_tier:
             return False
+        # Narrow-effective suppression: after global stall, cap dead-heavy
+        # signals at tier-0. Only fires once _last_new_native_cycle is far
+        # enough back that we're confident random+BMC has had its chance.
+        if cur >= 0 and self._is_point_on_narrow_effective_signal(point_id):
+            return False
         self._point_tier[point_id] = nxt
         return True
+
+    def _is_point_on_narrow_effective_signal(self, point_id: str) -> bool:
+        """True when point_id's parent signal has ≤30% of its bins
+        covered AND global coverage has stalled — a strong heuristic
+        that the remaining uncovered bins are dead RTL padding.
+
+        Cached in ``_narrow_effective_cache`` and invalidated whenever
+        new native coverage arrives; the SQL is cheap but a
+        per-BMC-call query would add up over thousands of calls."""
+        # Only meaningful after stall
+        if self._cycle - self._last_new_native_cycle < 500:
+            return False
+        # Extract signal from point_id (format: xtgl:HIER:SIG:BIT:DIR)
+        parts = point_id.split(":")
+        if len(parts) < 4 or parts[0] != "xtgl":
+            return False
+        sig = parts[2]
+        # Cache per-signal narrow-effective status
+        cache = getattr(self, "_narrow_effective_cache", None)
+        cache_stamp = getattr(self, "_narrow_effective_stamp", None)
+        if cache is None or cache_stamp != self._last_new_native_cycle:
+            self._narrow_effective_cache = {}
+            self._narrow_effective_stamp = self._last_new_native_cycle
+            cache = self._narrow_effective_cache
+        if sig in cache:
+            return cache[sig]
+        # Compute coverage fraction for this signal
+        row = self._conn.execute(
+            "SELECT SUM(CASE WHEN cp.point_id IS NULL THEN 0 ELSE 1 END) AS cov, "
+            "       COUNT(*) AS tot "
+            "FROM coverage_point_universe cpu "
+            "LEFT JOIN coverage_points cp ON cp.point_id = cpu.point_id "
+            "WHERE json_extract(cpu.details_json, '$.reg') LIKE ?",
+            (f"%.{sig}",)   # signal may be a suffix (hier stripped)
+        ).fetchone()
+        if not row or not row[1]:
+            cache[sig] = False
+            return False
+        cov, tot = row
+        frac = cov / tot if tot else 0
+        # 5% < frac ≤ 30% → narrow-effective (signal has some live bits
+        # but the rest are almost certainly dead). Below 5% is handled
+        # by the whole-signal dead-signal filter.
+        is_narrow = 0.05 < frac <= 0.30
+        cache[sig] = is_narrow
+        return is_narrow
 
     def get_point_tier(self, point_id: str) -> int:
         return self._point_tier.get(point_id, 0) if point_id else 0
@@ -431,48 +503,72 @@ class CoverageDB:
         if point_id:
             self._exhausted_coverage_points.add(point_id)
 
-    def detect_dead_signals(self, stall_cycles: int = 500) -> set[str]:
-        """Return signal names where every toggle bin remains uncovered
-        AND the design has shown no new native coverage for at least
-        `stall_cycles` cycles.
+    def detect_dead_signals(self,
+                             stall_cycles: int = 500,
+                             max_covered_fraction: float = 0.05) -> set[str]:
+        """Return signal names where the fraction of covered bins is
+        below ``max_covered_fraction`` AND the design has shown no new
+        native coverage for at least ``stall_cycles`` cycles.
 
-        Rationale: a signal whose every bit and every direction has
-        never toggled, even after coverage growth has plateaued (so
-        BMC has exhausted its ideas for finding new bins on what IS
-        reachable), is very likely *structurally unreachable* in the
-        current design configuration — bins under a disabled extension,
-        upper bits of a sparse register, dead-code paths gated by a
-        compile-time constant.
+        Rationale: a signal whose toggle bins remain mostly uncovered
+        even after coverage growth has plateaued (so BMC has exhausted
+        its ideas for finding new bins on what IS reachable) is very
+        likely *structurally unreachable* in the current design
+        configuration — bins under a disabled extension, upper bits of
+        a sparse register, dead-code paths gated by a compile-time
+        constant.
+
+        The threshold is *fraction* covered, not zero-covered, because
+        with seeded bias driving high baseline coverage many dead-
+        extension signals end up with 1-2 incidentally-covered bins
+        (peripheral writes through aliased structs). A signal with
+        ≤5% of bins covered after the active growth phase is still
+        dead for practical purposes; the few covered bits don't unlock
+        the rest.
 
         Tying detection to coverage stall (rather than a fixed cycle
         threshold) gives BMC its full natural lifecycle to reach hard
-        bins before we declare anything dead. Reachable signals that
-        BMC could solve will toggle during the active coverage-growth
-        phase; only after growth has stopped do we attribute their
-        absence to actual unreachability.
+        bins before we declare anything dead.
 
-        Returns ``set()`` if coverage hasn't yet stalled, so this can be
-        called unconditionally on every poll.
+        Returns ``set()`` if coverage hasn't yet stalled, so this can
+        be called unconditionally on every poll.
         """
         if self._cycle - self._last_new_native_cycle < stall_cycles:
             return set()
         rows = self._conn.execute(
             "SELECT json_extract(cpu.details_json, '$.reg') AS sig, "
-            "       SUM(CASE WHEN cp.point_id IS NULL THEN 0 ELSE 1 END) AS covered "
+            "       SUM(CASE WHEN cp.point_id IS NULL THEN 0 ELSE 1 END) AS covered, "
+            "       COUNT(*) AS total "
             "FROM coverage_point_universe cpu "
             "LEFT JOIN coverage_points cp ON cp.point_id = cpu.point_id "
             "WHERE json_extract(cpu.details_json, '$.reg') IS NOT NULL "
-            "GROUP BY sig "
-            "HAVING covered = 0"
+            "GROUP BY sig"
         ).fetchall()
-        return {r[0] for r in rows if r[0]}
+        out: set[str] = set()
+        for sig, covered, total in rows:
+            if not sig or not total:
+                continue
+            if covered / total <= max_covered_fraction:
+                out.add(sig)
+        return out
 
     def mark_signal_dead(self, signal: str) -> int:
         """Add every toggle bin associated with `signal` to the exhausted
-        set so the BMC target picker skips them. Returns the count of
-        newly-exhausted bins (0 if all were already exhausted)."""
+        set so the BMC coverage-target picker skips them, AND record
+        the signal name in ``_dead_signals`` so the register-target
+        picker also skips registers on this signal. Returns the count
+        of newly-exhausted bins (0 if all were already exhausted).
+
+        The signal-level set is consulted by
+        ``get_unvisited_neighbor_target`` to filter the iterated
+        register list. Without this, the orchestrator's register-target
+        fallback would keep picking dead-extension registers (e.g.
+        accelerator regs with the acc coproc disabled), burning BMC
+        budget on guaranteed timeouts.
+        """
         if not signal:
             return 0
+        self._dead_signals.add(signal)
         rows = self._conn.execute(
             "SELECT point_id FROM coverage_point_universe "
             "WHERE json_extract(details_json, '$.reg') = ?",

@@ -86,6 +86,12 @@ class DesignInfo:
     smt2_text:    str                 = ""
     verilog_files: list[str]          = field(default_factory=list)
     """All source files passed to Yosys (ordered: dependencies first, top last)."""
+    case_labels:  dict[str, list[int]] = field(default_factory=dict)
+    """Per-input-port set of literal values extracted from `case (...)`
+    statements in the RTL source. Used by the adaptive input bias model
+    to pre-credit known-interesting values at startup so the bias doesn't
+    have to discover them from cold via coverage feedback. Empty when
+    no `case` statements are found or extraction is skipped."""
 
     @property
     def data_inputs(self) -> list[PortInfo]:
@@ -248,7 +254,120 @@ def parse_design(
     # not the original SV sources which contain constructs xvlog may reject with
     # default parameter types.
     info.verilog_files = converted_files if converted_files is not None else files
+    # Extract per-port case-statement labels for adaptive bias seeding.
+    # Cheap regex scan over the Verilog the user gave us (or the sv2v
+    # output, which is what Yosys saw). Failures are non-fatal.
+    try:
+        info.case_labels = _extract_case_labels(info.verilog_files, info.inputs)
+    except Exception:
+        info.case_labels = {}
     return info
+
+
+# --------------------------------------------------------------------------- #
+# Case-label extractor (for adaptive input bias seeding)                       #
+# --------------------------------------------------------------------------- #
+
+_CASE_BLOCK_RE = re.compile(
+    r"\bcase\s*\(\s*([^)]+?)\s*\)(.+?)\bendcase\b",
+    re.DOTALL,
+)
+_LABEL_LINE_RE = re.compile(
+    r"^\s*((?:(?:\d+\s*'\s*[bhdBHD]\s*[0-9a-fA-F_xX?]+|\d+)\s*(?:,\s*)?)+)\s*:",
+    re.MULTILINE,
+)
+_SIZED_LIT_RE = re.compile(
+    r"(\d+)\s*'\s*([bhdBHD])\s*([0-9a-fA-F_xX?]+)"
+)
+_PORT_SUFFIXES = ("_i", "_in", "_input", "_o", "_out", "_q", "_d")
+
+
+def _port_stem(name: str) -> str:
+    for suf in _PORT_SUFFIXES:
+        if name.endswith(suf):
+            return name[:-len(suf)]
+    return name
+
+
+def _extract_case_labels(
+    verilog_files: list[str],
+    inputs: list[PortInfo],
+) -> dict[str, list[int]]:
+    """Scan Verilog source for `case (X) ... endcase` blocks; extract
+    integer labels and associate them with input ports by name match
+    (direct or via stem-substring against the case discriminator).
+
+    Returns a dict mapping port_name → sorted list of distinct values.
+    Conservative on width: only includes sized labels whose declared
+    width equals the port width — this avoids polluting wide ports
+    with labels from sub-range case discriminators.
+
+    Used to pre-credit the adaptive bias model (see ``input_bias.py``)
+    so it exploits known-valid values from cycle 1 instead of slowly
+    learning them via coverage feedback. Design-agnostic — any RTL
+    with `case` statements on input-derived signals benefits.
+    """
+    port_by_name = {p.name: p for p in inputs}
+    port_stems = [(_port_stem(p.name), p) for p in inputs]
+    # Sort stems longest-first so substring matches prefer the most
+    # specific port name (e.g. "csr_addr" wins over "csr").
+    port_stems.sort(key=lambda kv: -len(kv[0]))
+    result: dict[str, set[int]] = {p.name: set() for p in inputs}
+
+    for path in verilog_files:
+        try:
+            text = open(path).read()
+        except Exception:
+            continue
+        # Strip comments to keep them from generating false matches.
+        text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+
+        for case_m in _CASE_BLOCK_RE.finditer(text):
+            disc = case_m.group(1).strip()
+            body = case_m.group(2)
+
+            # Match the discriminator to an input port:
+            # (1) direct name equality
+            # (2) port stem appears as a substring in the discriminator
+            matched: "PortInfo | None" = None
+            if disc in port_by_name:
+                matched = port_by_name[disc]
+            else:
+                for stem, p in port_stems:
+                    if stem and stem in disc:
+                        matched = p
+                        break
+            if matched is None:
+                continue
+
+            pw = matched.width
+            mask = matched.mask
+
+            for lc in _LABEL_LINE_RE.finditer(body):
+                for part in lc.group(1).split(","):
+                    part = part.strip()
+                    sm = _SIZED_LIT_RE.fullmatch(part)
+                    if not sm:
+                        continue
+                    try:
+                        width = int(sm.group(1))
+                    except ValueError:
+                        continue
+                    if width != pw:
+                        continue
+                    digits = sm.group(3).replace("_", "").lower()
+                    if "x" in digits or "?" in digits:
+                        continue
+                    base = {"h": 16, "b": 2, "d": 10}[sm.group(2).lower()]
+                    try:
+                        val = int(digits, base) & mask
+                    except ValueError:
+                        continue
+                    result[matched.name].add(val)
+
+    # Drop empty entries and freeze as sorted lists.
+    return {p: sorted(vs) for p, vs in result.items() if vs}
 
 
 # --------------------------------------------------------------------------- #

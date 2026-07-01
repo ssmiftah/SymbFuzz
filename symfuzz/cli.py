@@ -220,6 +220,15 @@ def main(argv=None):
                          "Lower = more credit to the most recent draws "
                          "(default 0.95 = half-life ~14 draws; 0.9 ~ 7 "
                          "draws; >=1.0 disables recency weighting)")
+    ap.add_argument("--adaptive-input-bias-seed-rtl",
+                    dest="adaptive_input_bias_seed_rtl",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help="At startup, pre-credit the bias model with "
+                         "values extracted from RTL `case (...)` statements "
+                         "on input-derived signals. Shortcircuits the bias "
+                         "model's cold-start phase on control-heavy designs. "
+                         "(default: on; ignored when --adaptive-input-bias "
+                         "is off)")
     ap.add_argument("--dead-signal-filter", dest="dead_signal_filter",
                     action=argparse.BooleanOptionalAction, default=True,
                     help="After a warmup period, automatically blacklist "
@@ -556,6 +565,7 @@ def main(argv=None):
         adaptive_input_bias    = args.adaptive_input_bias,
         adaptive_input_bias_explore = args.adaptive_input_bias_explore,
         adaptive_input_bias_recency = args.adaptive_input_bias_recency,
+        adaptive_input_bias_seed_rtl = args.adaptive_input_bias_seed_rtl,
         dead_signal_filter         = args.dead_signal_filter,
         dead_signal_stall_cycles   = args.dead_signal_stall_cycles,
     )
@@ -615,6 +625,11 @@ def main(argv=None):
             print(f"  Adaptive bias  : {len(ports_with_credit)} ports learned;"
                   f" '{biggest_port}' has {n} distinct credited values"
                   f" (full table: {bias_path})")
+        seed_n = getattr(orch, "_bias_seed_count", 0)
+        if seed_n > 0:
+            seed_ports = getattr(orch, "_bias_seed_ports", [])
+            print(f"  Bias seed (RTL): {seed_n} (port,value) pairs from "
+                  f"`case` labels across {len(seed_ports)} ports")
     print("=" * 60)
 
 

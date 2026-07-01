@@ -84,9 +84,10 @@ class Orchestrator:
         adaptive_input_bias:   bool = False,
         adaptive_input_bias_explore: float = 0.3,
         adaptive_input_bias_recency: float = 0.95,
+        adaptive_input_bias_seed_rtl: bool = True,
         dead_signal_filter:   bool = True,
         dead_signal_stall_cycles: int = 500,
-        dead_signal_recheck_every: int = 20,
+        dead_signal_recheck_every: int = 1,
     ):
         self.design         = design
         self.driver         = driver
@@ -178,6 +179,19 @@ class Orchestrator:
                 explore_rate=float(adaptive_input_bias_explore),
                 recency_alpha=float(adaptive_input_bias_recency),
             )
+            # RTL-derived case-label seeding (step 2 of the bias plan).
+            # Pre-credits the model with valid values extracted from
+            # `case (...)` statements in the design source — works on
+            # any RTL with case statements (CSR write paths, decoders,
+            # state machines, handshake protocols).
+            if adaptive_input_bias_seed_rtl and design.case_labels:
+                seeded = self._bias_model.seed_from_case_labels(
+                    design.case_labels)
+                self._bias_seed_count = seeded
+                self._bias_seed_ports = sorted(design.case_labels.keys())
+            else:
+                self._bias_seed_count = 0
+                self._bias_seed_ports = []
         # Dead-signal filter: re-run dead-signal detection every N polls
         # once the warmup threshold is met, marking those signals'
         # toggle bins as exhausted so the BMC target picker skips them.

@@ -183,6 +183,42 @@ class InputBiasModel:
         self.poll_count += 1
         self._maybe_decay()
 
+    # ---- Pre-seeding ----------------------------------------------- #
+
+    def seed_from_case_labels(self,
+                              case_labels: dict[str, list[int]],
+                              credit_per_value: float = 10.0) -> int:
+        """Pre-credit the frequency tables from RTL-extracted case
+        statement labels. For each port present in `case_labels`, every
+        listed value receives `credit_per_value` units of credit so the
+        weighted-pick branch of :meth:`sample` will exploit them from
+        cycle 1.
+
+        Returns the total count of (port, value) pairs seeded.
+
+        Rationale: without seeding, the model takes many polls of
+        coverage feedback to discover that narrow control ports
+        (csr_op_i, csr_addr_i, etc.) only care about a small set of
+        valid values. Seeding from case-statement labels shortcircuits
+        that discovery — the labels ARE the set of valid values the
+        RTL acts on. Credit-per-value is chosen so that the seed
+        contributes meaningfully but doesn't dominate later
+        coverage-feedback credit (one typical poll attributes
+        ~10-50 units across all draws).
+        """
+        n = 0
+        for port, values in case_labels.items():
+            if port not in self.tables:
+                continue
+            table = self.tables[port]
+            for v in values:
+                if v in table:
+                    continue   # don't double-seed if caller is re-invoked
+                table[v] = credit_per_value
+                self.totals[port] += credit_per_value
+                n += 1
+        return n
+
     # ---- Maintenance ---------------------------------------------- #
 
     def _maybe_decay(self) -> None:
