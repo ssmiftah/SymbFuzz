@@ -110,18 +110,24 @@ class BaseStdioDriver:
     # ---- simulation commands ----------------------------------------- #
 
     def step(self, inputs: dict[str, int]) -> dict[str, int]:
-        resp = self._send({"cmd": "step", "inputs": inputs})
+        enc = {k: self._encode_val(v) for k, v in inputs.items()}
+        resp = self._send({"cmd": "step", "inputs": enc})
         if "error" in resp:
             raise RuntimeError(f"step error: {resp['error']}")
-        return resp.get("state", {})
+        raw = resp.get("state", {})
+        return {k: self._decode_val(v) for k, v in raw.items()}
 
     def step_trace(
         self, inputs_list: list[dict[str, int]]
     ) -> tuple[list[dict[str, int]], "str | None"]:
         if not inputs_list:
             return [], None
-        resp = self._send({"cmd": "step_trace", "inputs": inputs_list})
-        states = resp.get("states", [])
+        enc_list = [{k: self._encode_val(v) for k, v in inp.items()}
+                    for inp in inputs_list]
+        resp = self._send({"cmd": "step_trace", "inputs": enc_list})
+        raw_states = resp.get("states", [])
+        states = [{k: self._decode_val(v) for k, v in st.items()}
+                  for st in raw_states]
         err = resp.get("error")
         return states, err
 
@@ -134,10 +140,12 @@ class BaseStdioDriver:
         ``step_raw`` preserves the clk polarity the caller specified.
         Used by the BMC-replay path to reproduce clk2fflogic's
         alternating half-cycle transitions."""
-        resp = self._send({"cmd": "step_raw", "inputs": inputs})
+        enc = {k: self._encode_val(v) for k, v in inputs.items()}
+        resp = self._send({"cmd": "step_raw", "inputs": enc})
         if "error" in resp:
             raise RuntimeError(f"step_raw error: {resp['error']}")
-        return resp.get("state", {})
+        raw = resp.get("state", {})
+        return {k: self._decode_val(v) for k, v in raw.items()}
 
     def step_raw_trace(
         self, inputs_list: list[dict[str, int]]
@@ -146,8 +154,12 @@ class BaseStdioDriver:
         :meth:`step_trace`."""
         if not inputs_list:
             return [], None
-        resp = self._send({"cmd": "step_raw_trace", "inputs": inputs_list})
-        states = resp.get("states", [])
+        enc_list = [{k: self._encode_val(v) for k, v in inp.items()}
+                    for inp in inputs_list]
+        resp = self._send({"cmd": "step_raw_trace", "inputs": enc_list})
+        raw_states = resp.get("states", [])
+        states = [{k: self._decode_val(v) for k, v in st.items()}
+                  for st in raw_states]
         err = resp.get("error")
         return states, err
 
@@ -156,14 +168,43 @@ class BaseStdioDriver:
         if "error" in resp:
             raise RuntimeError(f"reset error: {resp['error']}")
 
+    @staticmethod
+    def _encode_val(v: int) -> "int | str":
+        """Encode a Python int into a JSON-safe representation. Narrow
+        values (fit in int64) pass through as ints; wider values become
+        `"0xhex"` strings so the harness's JSON parser can carry them
+        end-to-end without the JSON-number precision loss that would
+        clip a >64-bit value down to a double."""
+        v = int(v)
+        if 0 <= v <= (1 << 63) - 1:
+            return v
+        return f"0x{v:x}"
+
+    @staticmethod
+    def _decode_val(v) -> int:
+        """Decode a JSON value produced by the harness back into a
+        Python int. Accepts both plain integers (narrow signals) and
+        `0x...` hex strings (wide signals)."""
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            return int(s, 16) if s.lower().startswith("0x") else int(s)
+        raise TypeError(f"unexpected value type: {type(v).__name__}")
+
     def read_state(self) -> dict[str, int]:
         resp = self._send({"cmd": "read_state"})
         if "error" in resp:
             raise RuntimeError(f"read_state error: {resp['error']}")
-        return resp.get("state", {})
+        raw = resp.get("state", {})
+        return {k: self._decode_val(v) for k, v in raw.items()}
 
     def force(self, state: dict[str, int]) -> None:
-        resp = self._send({"cmd": "force", "state": state})
+        # Encode wide values as hex strings so they survive the JSON
+        # round-trip. Narrow values pass through as ints (unchanged
+        # wire format for pre-existing designs).
+        encoded = {k: self._encode_val(v) for k, v in state.items()}
+        resp = self._send({"cmd": "force", "state": encoded})
         if "error" in resp:
             raise RuntimeError(f"force error: {resp['error']}")
 

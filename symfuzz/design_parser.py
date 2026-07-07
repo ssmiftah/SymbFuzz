@@ -255,10 +255,18 @@ def parse_design(
     # default parameter types.
     info.verilog_files = converted_files if converted_files is not None else files
     # Extract per-port case-statement labels for adaptive bias seeding.
-    # Cheap regex scan over the Verilog the user gave us (or the sv2v
-    # output, which is what Yosys saw). Failures are non-fatal.
+    # Scan BOTH the original SV sources AND the sv2v output when both exist:
+    # the original preserves struct-field syntax (``case (fu_data_i.operation)``)
+    # that sv2v collapses to bit-slice form (``case (fu_data_i[202-:8])``),
+    # and the sv2v output preserves patterns Yosys/opt may have simplified.
+    # `_extract_case_labels` deduplicates results per port.
+    scan_paths = list(files)
+    if converted_files:
+        for p in converted_files:
+            if p not in scan_paths:
+                scan_paths.append(p)
     try:
-        info.case_labels = _extract_case_labels(info.verilog_files, info.inputs)
+        info.case_labels = _extract_case_labels(scan_paths, info.inputs)
     except Exception:
         info.case_labels = {}
     return info
@@ -279,6 +287,25 @@ _LABEL_LINE_RE = re.compile(
 _SIZED_LIT_RE = re.compile(
     r"(\d+)\s*'\s*([bhdBHD])\s*([0-9a-fA-F_xX?]+)"
 )
+# Matches struct-field access like ``fu_data_i.operation`` or
+# ``bp_resolve_o.pc`` in the original SV source. Captures:
+#   group 1: struct prefix (``fu_data`` / ``bp_resolve``)
+#   group 2: direction (``i`` / ``o``)
+#   group 3: field name  (``operation`` / ``pc``)
+# Used by the case-label extractor to reconstruct the flat wrapper-port
+# name ``<prefix>_<field>_<direction>``.
+_STRUCT_FIELD_RE = re.compile(r"^(\w+?)_([io])\.(\w+)$")
+# Matches a bit-slice discriminator like ``instr[6-:7]`` (Verilog +: /
+# -: syntax for indexed part-select) or ``instr[6:0]`` (traditional
+# part-select). Captures:
+#   group 1: port reference (``instr``)
+#   group 2: high bit / start (``6``)
+#   group 3: width for [Hi-:W] form  (``7``) — present only for -: form
+#   group 4: low bit for [Hi:Lo] form (``0``) — present only for : form
+# Used by the case-label extractor to identify cases that discriminate
+# on a bit-field of a wider input port and emit shifted seeds into that
+# wider port.
+_BIT_SLICE_RE = re.compile(r"^(\w+)\[(\d+)(?:-:(\d+)|:(\d+))\]$")
 _PORT_SUFFIXES = ("_i", "_in", "_input", "_o", "_out", "_q", "_d")
 
 
@@ -312,6 +339,10 @@ def _extract_case_labels(
     # Sort stems longest-first so substring matches prefer the most
     # specific port name (e.g. "csr_addr" wins over "csr").
     port_stems.sort(key=lambda kv: -len(kv[0]))
+    # Group ports by width for fast width-driven matching.
+    ports_by_width: dict[int, list[PortInfo]] = {}
+    for p in inputs:
+        ports_by_width.setdefault(p.width, []).append(p)
     result: dict[str, set[int]] = {p.name: set() for p in inputs}
 
     for path in verilog_files:
@@ -327,23 +358,17 @@ def _extract_case_labels(
             disc = case_m.group(1).strip()
             body = case_m.group(2)
 
-            # Match the discriminator to an input port:
-            # (1) direct name equality
-            # (2) port stem appears as a substring in the discriminator
-            matched: "PortInfo | None" = None
-            if disc in port_by_name:
-                matched = port_by_name[disc]
-            else:
-                for stem, p in port_stems:
-                    if stem and stem in disc:
-                        matched = p
-                        break
-            if matched is None:
-                continue
-
-            pw = matched.width
-            mask = matched.mask
-
+            # Two-pass strategy. Pass A collects raw sized labels from
+            # the body (they encode a width). Pass B picks the input
+            # port that best fits both the discriminator and the label
+            # width, then we assign labels to that port. The width
+            # signal is critical because SV wrappers commonly flatten
+            # a struct-typed port into per-field ports of different
+            # widths, and sv2v lowers a case on ``struct.field`` into
+            # a bit-slice ``struct_i[Hi-:W]`` — the field can no longer
+            # be read from the discriminator, but the label width still
+            # uniquely identifies it among the flat ports.
+            labels: list[tuple[int, int]] = []  # (width, value)
             for lc in _LABEL_LINE_RE.finditer(body):
                 for part in lc.group(1).split(","):
                     part = part.strip()
@@ -351,20 +376,150 @@ def _extract_case_labels(
                     if not sm:
                         continue
                     try:
-                        width = int(sm.group(1))
+                        w = int(sm.group(1))
                     except ValueError:
-                        continue
-                    if width != pw:
                         continue
                     digits = sm.group(3).replace("_", "").lower()
                     if "x" in digits or "?" in digits:
                         continue
                     base = {"h": 16, "b": 2, "d": 10}[sm.group(2).lower()]
                     try:
-                        val = int(digits, base) & mask
+                        val = int(digits, base)
                     except ValueError:
                         continue
-                    result[matched.name].add(val)
+                    labels.append((w, val))
+            if not labels:
+                continue
+
+            # Pick the modal label width — the case's operating width.
+            from collections import Counter as _Cnt
+            width_hist = _Cnt(w for w, _ in labels)
+            label_width, _ = width_hist.most_common(1)[0]
+
+            # Match the discriminator to an input port. Every path
+            # below yields a (port, bit_offset) pair — offset is 0 for
+            # full-port matches and non-zero for bit-slice
+            # discriminators, where labels get shifted to the slice's
+            # bit position before being seeded on the wider port.
+            matched: "PortInfo | None" = None
+            bit_offset: int = 0
+
+            # (1) direct name equality
+            if disc in port_by_name and port_by_name[disc].width == label_width:
+                matched = port_by_name[disc]
+
+            # (2) struct-field flatten (original SV source form):
+            #     `case (fu_data_i.operation)` → port `fu_data_operation_i`.
+            if matched is None:
+                sf = _STRUCT_FIELD_RE.match(disc)
+                if sf:
+                    candidate = f"{sf.group(1)}_{sf.group(3)}_{sf.group(2)}"
+                    p = port_by_name.get(candidate)
+                    if p is not None and p.width == label_width:
+                        matched = p
+
+            # (2.5) bit-slice discriminator: `case (instr[6-:7])` or
+            #       `case (instr[6:0])` with 7-bit labels. Find a wider
+            #       port (>= hi+1 bits) whose name relates to `instr`
+            #       and seed with values shifted to bit position `lo`.
+            #       Generic — the pattern applies to instruction
+            #       decoders (opcode/funct fields of a wider instr),
+            #       bus protocol demux, FSM state extraction, and any
+            #       other case on a sub-range of a wide input.
+            if matched is None:
+                sm = _BIT_SLICE_RE.match(disc)
+                if sm:
+                    port_ref = sm.group(1)
+                    hi = int(sm.group(2))
+                    if sm.group(3) is not None:
+                        slice_width = int(sm.group(3))
+                        lo = hi - slice_width + 1
+                    else:
+                        lo = int(sm.group(4))
+                        slice_width = hi - lo + 1
+                    if slice_width == label_width and lo >= 0:
+                        best_p = None
+                        best_score = -1
+                        for p in inputs:
+                            if p.width <= hi:
+                                continue
+                            if p.name == port_ref:
+                                score = 1000
+                            elif port_ref in p.name or p.name.startswith(port_ref):
+                                score = 500 + len(port_ref)
+                            else:
+                                n = min(len(port_ref), len(p.name))
+                                c = 0
+                                for i in range(n):
+                                    if port_ref[i] != p.name[i]:
+                                        break
+                                    c += 1
+                                score = 100 + c if c >= 3 else -1
+                            if score > best_score:
+                                best_p = p
+                                best_score = score
+                        if best_p is not None:
+                            matched = best_p
+                            bit_offset = lo
+
+            # (3) width-driven port match: among wrapper ports whose
+            #     width matches the label width, find one whose name
+            #     relates to the discriminator's leading identifier.
+            #     Three sub-rules by decreasing specificity:
+            #       a) port stem starts with disc's leading stem — handles
+            #          sv2v output `case (fu_data_i[202-:8])` where the
+            #          8-bit port `fu_data_operation_i` is the sub-field
+            #          of the same struct.
+            #       b) port stem is a substring of the disc — handles
+            #          `case (conv_csr_addr[11-:12])` matching
+            #          `csr_addr_i` (its stem is inside the internal name).
+            #       c) longest common prefix of ≥3 chars — catches
+            #          shortened names like `instr[6-:7]` matching
+            #          `instruction_i`.
+            if matched is None:
+                candidates = ports_by_width.get(label_width, [])
+                if candidates:
+                    lead_m = re.match(r"(\w+)", disc)
+                    lead_id = lead_m.group(1) if lead_m else disc
+                    lead_stem = _port_stem(lead_id)
+                    best_score = -1
+                    for p in candidates:
+                        ps = _port_stem(p.name)
+                        if not ps:
+                            continue
+                        # a) subfield: stem starts with lead_stem + "_"
+                        if lead_stem and (
+                                ps == lead_stem
+                                or ps.startswith(lead_stem + "_")):
+                            score = 1000 + len(ps)  # highest priority
+                        # b) stem substring
+                        elif ps in disc or p.name in disc:
+                            score = 500 + len(ps)
+                        else:
+                            # c) longest common prefix ≥ 3 chars
+                            n = min(len(lead_id), len(p.name))
+                            common = 0
+                            for i in range(n):
+                                if lead_id[i] != p.name[i]:
+                                    break
+                                common += 1
+                            if common >= 3:
+                                score = 100 + common
+                            else:
+                                score = -1
+                        if score > best_score:
+                            best_score = score
+                            matched = p
+
+            if matched is None:
+                continue
+
+            mask = matched.mask
+            for w, val in labels:
+                if w != label_width:
+                    continue
+                shifted = (val << bit_offset) if bit_offset else val
+                result[matched.name].add(shifted & mask)
 
     # Drop empty entries and freeze as sorted lists.
     return {p: sorted(vs) for p, vs in result.items() if vs}
@@ -451,13 +606,6 @@ def _parse_smt2_annotations(smt2_text: str, verilog_path: str) -> DesignInfo:
         # Verilator folds away. They're not addressable at runtime, so
         # force/read_state would fail. Identify by the autoblock prefix.
         if "sv2v_autoblock" in arch_name or "sv2v_tmp_" in arch_name:
-            continue
-        # Skip registers wider than 64 bits — the JSON force/read_state
-        # protocol and the Verilator harness template use uint64_t. Wider
-        # registers come from packed arrays (e.g. pmpaddr_q[64][54]) that
-        # Yosys flattens. Coverage on these still tracks toggle bins; we
-        # just can't force them directly.
-        if width > 64:
             continue
         if arch_name in seen_arch_names:
             continue

@@ -120,13 +120,12 @@ InputSequence parse_input_sequence(const std::string& model_text,
             if (p.name == port_name) { width = p.width; break; }
         }
 
-        // Parse value: "true"/"false" or "#bXXX" or "#xXXX" or decimal
-        uint64_t val = 0;
-        if (value_atom == "true")  val = 1;
-        else if (value_atom == "false") val = 0;
-        else val = parse_bv_literal(value_atom, width);
-
-        seq.steps[step][port_name] = val;
+        // Normalise any SMT witness value (true / false / #bXXX / #xXXX /
+        // decimal) into a hex-string "0xdeadbeef" of the correct width.
+        // Wide inputs (>64 bits) round-trip losslessly this way; narrow
+        // inputs are still hex to keep downstream JSON parsing uniform.
+        std::string val_hex = parse_bv_literal_to_hex(value_atom, width);
+        seq.steps[step][port_name] = val_hex;
     }
 
     return seq;
@@ -153,15 +152,10 @@ void print_input_sequence(const InputSequence& seq, const DesignModel& model) {
     for (int i = 0; i < seq.depth; ++i) {
         std::cout << std::setw(step_w) << i;
         for (const auto& pn : ports) {
-            uint64_t val = 0;
+            std::string val_str = "-";
             auto it = seq.steps[i].find(pn);
-            if (it != seq.steps[i].end()) val = it->second;
-
-            int width = 1;
-            for (const auto& p : model.inputs)
-                if (p.name == pn) { width = p.width; break; }
-
-            std::cout << "  " << std::setw(10) << format_value(val, width);
+            if (it != seq.steps[i].end()) val_str = it->second;
+            std::cout << "  " << std::setw(10) << val_str;
         }
         std::cout << "\n";
     }
@@ -176,7 +170,10 @@ std::string to_json(const InputSequence& seq) {
         for (const auto& [port, val] : seq.steps[i]) {
             if (!first) j << ", ";
             first = false;
-            j << "\"" << port << "\": " << val;
+            // val is a hex string like "0xdeadbeef". Emit as JSON string
+            // so wide values survive the trip to Python without any
+            // narrowing/precision loss.
+            j << "\"" << port << "\": \"" << val << "\"";
         }
         j << "}";
         if (i + 1 < seq.depth) j << ",";

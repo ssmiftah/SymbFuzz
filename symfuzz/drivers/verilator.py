@@ -130,11 +130,14 @@ _FIELD_RE = re.compile(r"\x01([^\x02]+)\x02([^\x01]*)")
 _COV_LINE_RE = re.compile(r"^C '([^']*)'\s+(\d+)\s*$", re.MULTILINE)
 
 
-# Verilator's `o` field for toggle bins is `<sig>[<bit>]` on older builds and
-# `<sig>[<bit>]:0->1` / `:1->0` on newer ones (which split rise/fall into
-# separate cov.dat rows). The third capture group, when present, names the
-# direction so we don't double-emit rise+fall for that bin.
-_OBJ_BIT_RE = re.compile(r"^(\w[\w$.]*?)\[(\d+)\](?::(0->1|1->0))?$")
+# Verilator's `o` field for toggle bins has three shapes we care about:
+#   `<sig>[<bit>]`               — old (pre-5.x) multi-bit format
+#   `<sig>[<bit>]:0->1|1->0`     — new (5.x) multi-bit with direction
+#   `<sig>:0->1|1->0`            — new (5.x) 1-bit signal with direction
+# The `[bit]` group is optional — without it, bit defaults to 0. The direction
+# capture (third group) lets us emit one PID per direction instead of
+# double-counting rise+fall on the old aggregate format.
+_OBJ_BIT_RE = re.compile(r"^(\w[\w$.]*?)(?:\[(\d+)\])?(?::(0->1|1->0))?$")
 
 
 def _fully_qualified(hier: str, sig: str, top_module: str | None) -> str:
@@ -187,7 +190,10 @@ def _parse_verilator_cov_dat(text: str,
             #  anything else            → aggregate; bit=0, both directions.
             m2 = _OBJ_BIT_RE.match(o)
             if m2:
-                sig_raw, bit = m2.group(1), int(m2.group(2))
+                sig_raw = m2.group(1)
+                # `[bit]` group is optional in the regex; default to 0
+                # when absent (as it is for 1-bit signals).
+                bit = int(m2.group(2)) if m2.group(2) is not None else 0
                 dir_suffix = m2.group(3)
             else:
                 sig_raw, bit = o, 0

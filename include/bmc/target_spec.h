@@ -7,7 +7,13 @@ namespace symbfuzz {
 
 struct WireConstraint {
     std::string wire_name;   // must match a name in DesignModel
-    uint64_t    value;       // full-width value (bit == -1) OR bit value 0/1 (bit >= 0)
+    // Value in hex-string form ("0xdeadbeef", any width). Full-width
+    // equality when bit == -1; single-bit value ("0" or "1") when
+    // bit >= 0. Hex form is chosen so widths >64 bits round-trip
+    // between Python, CLI, and SMT2 without any uint64 truncation.
+    // Kept as a string even for narrow values because the smt2_builder
+    // wants a bit-width-parameterised SMT2 literal, not a native int.
+    std::string value;
     int         width;       // bit width (filled in from DesignModel)
     bool        returns_bool = false; // true when SMT2 accessor returns Bool (not BitVec)
     int         bit = -1;    // -1 → full-wire equality (legacy).

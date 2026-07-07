@@ -113,6 +113,16 @@ class BmcInterface:
             "--max-steps", str(eff_max_steps),
             "--timeout",   str(eff_timeout_ms),
         ]
+        # `_fmt` normalises a Python int into a form the C++ CLI can
+        # unambiguously parse. Narrow values pass through as decimal;
+        # values wider than uint64 become a `0x...` hex string so no
+        # precision is lost across the process boundary.
+        def _fmt(v: int) -> str:
+            v = int(v)
+            if v < 0 or v > (1 << 64) - 1:
+                return f"0x{v:x}"
+            return str(v)
+
         for reg_name, spec in targets.items():
             if isinstance(spec, dict) and spec.get("flip"):
                 # Temporal-flip goal: bit K equals V at step k, NOT V at k-1.
@@ -123,7 +133,7 @@ class BmcInterface:
                 cmd += ["--target-bit",
                         f"{reg_name}={int(spec['bit'])}={int(spec['val'])}"]
             else:
-                cmd += ["--target", f"{reg_name}={int(spec)}"]
+                cmd += ["--target", f"{reg_name}={_fmt(spec)}"]
 
         if self.verbose:
             print(f"[bmc] {' '.join(cmd)}")
@@ -196,14 +206,22 @@ class BmcInterface:
 
         steps = data.get("steps", [])
 
-        # Return the full step list *including* clk. The orchestrator
-        # replays these via driver.step_raw_trace, which drives the clock
-        # explicitly from each step's inputs — preserving clk2fflogic's
-        # alternating negedge/posedge half-cycle semantics exactly as BMC
-        # saw them. (Previously we filtered to posedge-only, which dropped
-        # the negedge inputs BMC's SAT witness depended on — see Phase 4
-        # full-trace replay plan.)
-        clean_steps = list(steps)
+        # The C++ BMC binary emits input values as JSON strings in
+        # hex-string form ("0xdeadbeef") so widths >64 bits round-trip
+        # without JSON-number precision loss. Decode back to Python
+        # ints (arbitrary precision) for downstream driver.step /
+        # driver.force consumption. Also tolerate legacy int form for
+        # any pre-rebuild BMC binary that may still be on PATH.
+        def _to_int(v):
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str):
+                s = v.strip()
+                return int(s, 16) if s.lower().startswith("0x") else int(s)
+            raise TypeError(f"unexpected BMC value type: {type(v).__name__}")
+
+        clean_steps = [{k: _to_int(v) for k, v in step.items()}
+                       for step in steps]
 
         depth_val = data.get("depth", len(steps))
         # SAT records are written by the orchestrator after the post-replay

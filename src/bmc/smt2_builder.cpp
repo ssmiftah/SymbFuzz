@@ -76,20 +76,49 @@ std::string build_bmc_query(const DesignModel& model,
             acc_prev = "(" + accessor(M, c.wire_name) + " "
                      + state_var(depth - 1) + ")";
 
+        // Interpret `c.value` (hex/decimal/SMT2 literal string) as the
+        // value's low bit for bit-level constraints, or as the full
+        // width for full-width constraints. For Bool accessors, only
+        // the LSB matters.
+        // Quick low-bit extract: last hex nibble of the normalised
+        // value has the LSB in its bit 0.
+        auto lsb_of = [](const std::string& s) -> int {
+            // Handles "0" / "1" / decimal / hex — reuse the utility.
+            std::string hex = "0x" + (s.empty() ? std::string("0") : s);
+            (void)hex;
+            // Simpler: parse to uint64_t (safe for LSB) via existing helper.
+            return static_cast<int>(parse_bv_literal(s.substr(0,2) == "#b" || s.substr(0,2) == "#x"
+                                                    ? s : "#b" + std::string("0"), 1) & 1);
+        };
+        (void)lsb_of;   // placeholder — actual LSB fetched below
+        auto lsb_from_string = [](const std::string& s) -> int {
+            if (s.empty()) return 0;
+            if (s == "true")  return 1;
+            if (s == "false") return 0;
+            // Take the last character of the value's low nibble. For
+            // decimal/hex, look at the trailing character.
+            char c = s.back();
+            if (c >= '0' && c <= '9') return (c - '0') & 1;
+            if (c >= 'a' && c <= 'f') return ((c - 'a' + 10)) & 1;
+            if (c >= 'A' && c <= 'F') return ((c - 'A' + 10)) & 1;
+            return 0;
+        };
+
         if (c.returns_bool) {
             // 1-bit Bool accessor: assert true/false directly at step k, and
             // — if flip is requested — the opposite at step k-1.
-            std::string cur = (c.value ? acc : "(not " + acc + ")");
+            int lsb = lsb_from_string(c.value);
+            std::string cur = (lsb ? acc : "(not " + acc + ")");
             if (c.flip && depth >= 1) {
-                std::string prev = (c.value ? "(not " + acc_prev + ")"
-                                             : acc_prev);
+                std::string prev = (lsb ? "(not " + acc_prev + ")"
+                                        : acc_prev);
                 q << "(assert (and " << cur << " " << prev << "))\n";
             } else {
                 q << "(assert " << cur << ")\n";
             }
         } else if (c.bit >= 0) {
             // Bit-extract equality. Constant form is `(_ bv<value> <width>)`.
-            unsigned long long v_cur = c.value & 1ULL;
+            unsigned long long v_cur = lsb_from_string(c.value) & 1ULL;
             std::string ext_cur = "((_ extract " + std::to_string(c.bit) + " "
                                 + std::to_string(c.bit) + ") " + acc + ")";
             if (c.flip && depth >= 1) {
@@ -104,8 +133,9 @@ std::string build_bmc_query(const DesignModel& model,
                 q << "(assert (= " << ext_cur << " (_ bv" << v_cur << " 1)))\n";
             }
         } else {
-            // Legacy full-width equality.
-            q << "(assert (= " << acc << " " << to_bv_literal(c.value, c.width) << "))\n";
+            // Full-width equality — width is not bounded by uint64,
+            // so we route through the hex-string SMT2 literal builder.
+            q << "(assert (= " << acc << " " << to_bv_literal_from_hex(c.value, c.width) << "))\n";
         }
     }
     q << "\n";

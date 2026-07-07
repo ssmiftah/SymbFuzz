@@ -7,8 +7,11 @@
 
 namespace symbfuzz {
 
-// One cycle's worth of input port values
-using CycleInputs = std::map<std::string, uint64_t>;
+// One cycle's worth of input port values. Values are stored as
+// hex-string form ("0xdeadbeef") so widths >64 bits round-trip without
+// truncation. Narrow values (≤64 bits) are still hex to keep the
+// witness JSON emission uniform; Python decodes both forms.
+using CycleInputs = std::map<std::string, std::string>;
 
 struct InputSequence {
     int                       depth;   // number of cycles

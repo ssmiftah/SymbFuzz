@@ -814,6 +814,29 @@ class Orchestrator:
                       f"bit={bit} → wire (reach-value)")
             return {sig: {"bit": bit, "val": val}}
 
+        # Tail-name fallback: Verilator's coverage reports internal-
+        # hierarchical names (e.g. ``i_dut.fence_o``) while the wire
+        # cache is keyed by top-level port names (``fence_o``). When the
+        # wrapper's internal signal aliases a top-level output/wire, the
+        # trailing component matches the wire cache. Then a
+        # port-convention fallback: if the tail lacks a common
+        # port-suffix, try appending ``_o`` (output) or ``_i`` (input)
+        # — the wrapper often connects ``.port_o(internal_name)`` where
+        # ``internal_name`` is the tail Verilator observes and the
+        # wire cache has ``port_o``. This is a generic pattern for any
+        # wrapper-based fuzz setup.
+        if "." in sig:
+            tail = sig.rsplit(".", 1)[1]
+            for candidate in (tail, tail + "_o", tail + "_i"):
+                if candidate in wires:
+                    if bit >= wires[candidate]:
+                        return None
+                    if self.verbose:
+                        print(f"[orch] coverage-target classify: sig={sig} "
+                              f"bit={bit} → wire[tail={candidate}] "
+                              f"(reach-value)")
+                    return {candidate: {"bit": bit, "val": val}}
+
         if self.verbose:
             print(f"[orch] coverage-target classify: sig={sig} "
                   f"bit={bit} → UNRESOLVED (falling back)")
@@ -1176,8 +1199,16 @@ class Orchestrator:
             # (max_state_space == 1 when no registers) — they'd terminate
             # after the initial state record before native coverage has a
             # chance to observe anything.
+            # State-space exhaustion — only meaningful when native coverage
+            # isn't being tracked. Combinational-heavy designs (alu, decoder,
+            # commit_stage wrappers) have tiny state spaces (2-8 states from
+            # a handful of registered pipeline latches) but their native
+            # toggle-bin universe can still have hundreds of uncovered bins.
+            # If native_coverage is on, defer termination to the native-
+            # complete or no-more-targets signals instead.
             max_s = self.design.max_state_space
-            if (max_s > 1 and max_s <= (1 << 20)
+            if (not self.native_coverage
+                    and max_s > 1 and max_s <= (1 << 20)
                     and self.coverage_db.total_states() >= max_s):
                 termination = "full_coverage"
                 break
@@ -1228,18 +1259,40 @@ class Orchestrator:
                         self.coverage_db.mark_coverage_point_exhausted(
                             cov_info.get("point_id", ""))
                         cov_info = None
-                if cov_info and cov_info.get("kind") == "toggle":
-                    t = self._toggle_target_to_bmc_target(cov_info)
-                    if t is not None:
-                        if self.verbose:
-                            print(f"[orch] coverage target: "
-                                  f"toggle {cov_info.get('reg')} "
-                                  f"bit {cov_info.get('bit')} "
-                                  f"{cov_info.get('dir')} → {t}")
-                        target = t
-                        target_kind = "coverage_toggle"
-                        target_point_id = cov_info.get("point_id")
-                        target_tier = int(cov_info.get("tier", 0) or 0)
+                # Try up to K translatable candidates. When the picker
+                # returns a coverage point whose kind isn't 'toggle', or
+                # whose signal isn't in registers/wires (untranslatable),
+                # mark it exhausted and try the next one. Without this
+                # retry, combinational-heavy designs whose uncovered
+                # universe is dominated by branch/line coverage bins
+                # (no `reg` field) terminate immediately: the first
+                # picked point returns None from the translator, the
+                # register-target fallback returns None too, and we
+                # give up with `no_more_targets` before any real BMC.
+                _skip_tries = 0
+                _MAX_SKIP = 32
+                while cov_info and target is None and _skip_tries < _MAX_SKIP:
+                    if cov_info.get("kind") == "toggle":
+                        t = self._toggle_target_to_bmc_target(cov_info)
+                        if t is not None:
+                            if self.verbose:
+                                print(f"[orch] coverage target: "
+                                      f"toggle {cov_info.get('reg')} "
+                                      f"bit {cov_info.get('bit')} "
+                                      f"{cov_info.get('dir')} → {t}")
+                            target = t
+                            target_kind = "coverage_toggle"
+                            target_point_id = cov_info.get("point_id")
+                            target_tier = int(cov_info.get("tier", 0) or 0)
+                            break
+                    # Untranslatable (branch/line bin, wire not in cache,
+                    # etc.) — retire and try the next candidate.
+                    self.coverage_db.mark_coverage_point_exhausted(
+                        cov_info.get("point_id", ""))
+                    _skip_tries += 1
+                    cov_info = self.coverage_db.get_uncovered_coverage_target(
+                        rarity_weighted=self.bmc_target_rarity,
+                    )
             if target is None:
                 target = self.coverage_db.get_unvisited_neighbor_target()
             if target is None:

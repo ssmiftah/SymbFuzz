@@ -32,17 +32,104 @@ static void clk_posedge() {
     top->eval();
 }
 
+// ---- Wide-value helpers (>64-bit ports) ------------------------------- //
+
+// Parse a JSON value string — either "42" (decimal), "0xdeadbeef" (hex),
+// or a quoted "\"0xdeadbeef\"" — into an LSB-first array of 32-bit words.
+// Values narrower than the buffer are zero-extended; excess input bits
+// beyond `n_words * 32` are silently discarded.
+static void parse_value_to_words(const std::string& s_in, uint32_t* words, int n_words) {
+    for (int i = 0; i < n_words; ++i) words[i] = 0;
+    std::string s = s_in;
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' ||
+                          s.front() == '\n' || s.front() == '\r')) s.erase(s.begin());
+    while (!s.empty() && (s.back()  == ' ' || s.back()  == '\t' ||
+                          s.back()  == '\n' || s.back()  == '\r')) s.pop_back();
+    if (s.size() >= 2 && s.front() == '"' && s.back() == '"') s = s.substr(1, s.size() - 2);
+    if (s.empty()) return;
+    bool is_hex = (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'));
+    if (is_hex) {
+        std::string h = s.substr(2);
+        int len = (int)h.size();
+        for (int nibble = 0; nibble < len; ++nibble) {
+            char c = h[len - 1 - nibble];
+            int v = 0;
+            if (c >= '0' && c <= '9') v = c - '0';
+            else if (c >= 'a' && c <= 'f') v = 10 + (c - 'a');
+            else if (c >= 'A' && c <= 'F') v = 10 + (c - 'A');
+            else continue;
+            int bit_off  = nibble * 4;
+            int word_idx = bit_off / 32;
+            int bit_idx  = bit_off % 32;
+            if (word_idx < n_words) words[word_idx] |= (uint32_t)v << bit_idx;
+        }
+    } else {
+        uint64_t v = 0;
+        try { v = std::stoull(s); } catch (...) {}
+        if (n_words > 0) words[0] = (uint32_t)(v & 0xFFFFFFFFu);
+        if (n_words > 1) words[1] = (uint32_t)(v >> 32);
+    }
+}
+
+// Parse a JSON value string as a narrow uint64_t.
+static uint64_t parse_value_uint64(const std::string& s_in) {
+    uint32_t words[2] = {0, 0};
+    parse_value_to_words(s_in, words, 2);
+    return ((uint64_t)words[1] << 32) | words[0];
+}
+
+// Format an LSB-first uint32_t array as a JSON hex-string value:
+//   "0xhexdigits"   (with the surrounding quotes)
+// `width` is the port's bit width; we emit ceil(width/4) hex digits.
+template <typename WideT>
+static std::string wide_to_hex_json(const WideT& v, int width) {
+    int total = (width + 3) / 4;
+    std::string s;
+    s.reserve(total + 4);
+    s.push_back('"'); s.push_back('0'); s.push_back('x');
+    for (int nibble = total - 1; nibble >= 0; --nibble) {
+        int bit_off  = nibble * 4;
+        int word_idx = bit_off / 32;
+        int bit_idx  = bit_off % 32;
+        uint32_t w = v[word_idx];
+        int nv = (w >> bit_idx) & 0xF;
+        s.push_back(nv < 10 ? char('0' + nv) : char('a' + nv - 10));
+    }
+    s.push_back('"');
+    return s;
+}
+
 // ---- Input routing ---------------------------------------------------- //
 
-static void set_input(const std::string& name, uint64_t val) {
+static void set_input(const std::string& name, const std::string& str_val) {
 {% for inp in data_inputs %}
-    if (name == "{{ inp.name }}") { top->{{ inp.name }} = (decltype(top->{{ inp.name }}))val; return; }
+{% if inp.width <= 64 %}
+    if (name == "{{ inp.name }}") { uint64_t v_ = parse_value_uint64(str_val); top->{{ inp.name }} = (decltype(top->{{ inp.name }}))v_; return; }
+{% else %}
+    if (name == "{{ inp.name }}") {
+        constexpr int N_WORDS = ({{ inp.width }} + 31) / 32;
+        uint32_t words[N_WORDS];
+        parse_value_to_words(str_val, words, N_WORDS);
+        for (int i = 0; i < N_WORDS; ++i) top->{{ inp.name }}[i] = words[i];
+        return;
+    }
+{% endif %}
 {% endfor %}
 }
 
-static void force_reg(const std::string& name, uint64_t val) {
+static void force_reg(const std::string& name, const std::string& str_val) {
 {% for reg in registers %}
-    if (name == "{{ reg.arch_name }}") { top->rootp->{{ module }}__DOT__{{ reg.verilator_path }} = (decltype(top->rootp->{{ module }}__DOT__{{ reg.verilator_path }}))val; return; }
+{% if reg.width <= 64 %}
+    if (name == "{{ reg.arch_name }}") { uint64_t v_ = parse_value_uint64(str_val); top->rootp->{{ module }}__DOT__{{ reg.verilator_path }} = (decltype(top->rootp->{{ module }}__DOT__{{ reg.verilator_path }}))v_; return; }
+{% else %}
+    if (name == "{{ reg.arch_name }}") {
+        constexpr int N_WORDS = ({{ reg.width }} + 31) / 32;
+        uint32_t words[N_WORDS];
+        parse_value_to_words(str_val, words, N_WORDS);
+        for (int i = 0; i < N_WORDS; ++i) top->rootp->{{ module }}__DOT__{{ reg.verilator_path }}[i] = words[i];
+        return;
+    }
+{% endif %}
 {% endfor %}
 }
 
@@ -52,7 +139,11 @@ static std::string emit_state_str() {
     std::ostringstream os;
     os << "{";
 {% for reg in registers %}
+{% if reg.width <= 64 %}
     os << "\"{{ reg.arch_name }}\":" << (uint64_t)(top->rootp->{{ module }}__DOT__{{ reg.verilator_path }}){% if not loop.last %} << ","{% endif %};
+{% else %}
+    os << "\"{{ reg.arch_name }}\":" << wide_to_hex_json(top->rootp->{{ module }}__DOT__{{ reg.verilator_path }}, {{ reg.width }}){% if not loop.last %} << ","{% endif %};
+{% endif %}
 {% endfor %}
     os << "}";
     return os.str();
@@ -125,14 +216,17 @@ static std::vector<std::string> json_split_objs(const std::string& body) {
     return out;
 }
 
-// Extract "key":integer pairs from a JSON object body (used for inputs/state).
-static std::vector<std::pair<std::string, uint64_t>> json_parse_kv(const std::string& body) {
-    std::vector<std::pair<std::string, uint64_t>> out;
-    std::regex re("\"(\\w+)\"\\s*:\\s*(\\d+)");
+// Extract "key":value pairs from a JSON object body. Value can be a
+// plain integer (narrow: `42`) OR a quoted hex string (wide:
+// `"0xdeadbeef"`). Per-port dispatch parses the value string according
+// to the port's declared width.
+static std::vector<std::pair<std::string, std::string>> json_parse_kv(const std::string& body) {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::regex re("\"(\\w+)\"\\s*:\\s*(\"[^\"]*\"|-?\\d+)");
     auto begin = std::sregex_iterator(body.begin(), body.end(), re);
     auto end   = std::sregex_iterator();
     for (auto it = begin; it != end; ++it) {
-        out.emplace_back((*it)[1].str(), std::stoull((*it)[2].str()));
+        out.emplace_back((*it)[1].str(), (*it)[2].str());
     }
     return out;
 }
@@ -196,7 +290,7 @@ int main(int argc, char** argv) {
                 try {
                     for (const auto& kv : json_parse_kv(obj)) {
                         if (kv.first == "{{ clock_port }}") {
-                            top->{{ clock_port }} = (decltype(top->{{ clock_port }}))kv.second;
+                            { uint64_t v_ = parse_value_uint64(kv.second); top->{{ clock_port }} = (decltype(top->{{ clock_port }}))v_; }
                         } else {
                             set_input(kv.first, kv.second);
                         }
@@ -275,7 +369,14 @@ int main(int argc, char** argv) {
             // Zero all data inputs so lingering values do not bleed through
             // the trailing post-deassertion edge (same fix as tcl_bridge).
 {% for inp in data_inputs %}
+{% if inp.width <= 64 %}
             top->{{ inp.name }} = 0;
+{% else %}
+            {
+                constexpr int N_WORDS = ({{ inp.width }} + 31) / 32;
+                for (int i = 0; i < N_WORDS; ++i) top->{{ inp.name }}[i] = 0;
+            }
+{% endif %}
 {% endfor %}
 {% if reset_port %}
             top->{{ reset_port }} = {{ "0" if reset_active_low else "1" }};

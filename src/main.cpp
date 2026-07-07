@@ -39,14 +39,20 @@ void print_usage(const char* argv0) {
         "  symbfuzz sub.v top.v --top top --target count=10 --max-steps 15\n";
 }
 
-// Parse "wire=value" into a WireConstraint (width filled later)
+// Parse "wire=value" into a WireConstraint (width filled later). The
+// value token can be decimal ("42"), hex ("0xdeadbeef"), or an SMT2
+// literal ("#b1010", "#x2a"). Storing the raw text on the constraint
+// keeps arbitrary widths intact — the smt2_builder normalises it to a
+// #bXXX literal at emit time.
 symbfuzz::WireConstraint parse_constraint(const std::string& s) {
     auto eq = s.find('=');
     if (eq == std::string::npos)
         throw std::invalid_argument("Expected wire=value, got: " + s);
-    std::string name  = s.substr(0, eq);
-    uint64_t    value = std::stoull(s.substr(eq + 1));
-    return {name, value, 1};  // width filled after model is parsed
+    symbfuzz::WireConstraint c;
+    c.wire_name = s.substr(0, eq);
+    c.value     = s.substr(eq + 1);
+    c.width     = 1;   // filled after model is parsed
+    return c;
 }
 
 // Parse "wire=bit=val" and set flip=true on the returned constraint.
@@ -60,15 +66,17 @@ symbfuzz::WireConstraint parse_bit_constraint(const std::string& s) {
     auto eq2 = s.find('=', eq1 + 1);
     if (eq2 == std::string::npos)
         throw std::invalid_argument("Expected wire=bit=val (missing second '='): " + s);
-    std::string name = s.substr(0, eq1);
     int bit = std::stoi(s.substr(eq1 + 1, eq2 - eq1 - 1));
-    uint64_t val = std::stoull(s.substr(eq2 + 1));
-    if (val > 1)
+    std::string val_str = s.substr(eq2 + 1);
+    if (val_str != "0" && val_str != "1")
         throw std::invalid_argument("Bit value must be 0 or 1: " + s);
     if (bit < 0)
         throw std::invalid_argument("Bit index must be non-negative: " + s);
-    symbfuzz::WireConstraint c{name, val, 1};
-    c.bit = bit;
+    symbfuzz::WireConstraint c;
+    c.wire_name = s.substr(0, eq1);
+    c.value     = val_str;
+    c.width     = 1;
+    c.bit       = bit;
     return c;
 }
 
