@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/samit/PhD/Projects/SymbFuzz/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
